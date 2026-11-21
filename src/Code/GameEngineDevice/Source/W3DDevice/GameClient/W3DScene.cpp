@@ -30,6 +30,12 @@
 // FUNCTION: BFME2 0x0006ED29 size=13 name=?rva0006ED29@Rva0006ED29@@QAEXPAX@Z evidence=?:placeholder tier=B hypothesis:K
 
 // FUNCTION: BFME2 0x0006ED36 size=31 name=?doRender@RTS3DScene@@QAEXPAVCameraClass@@@Z evidence=N:ledger tier=B hypothesis:K
+void RTS3DScene::doRender(CameraClass *camera)
+{
+	m_camera = camera;
+	draw();
+	m_camera = NULL;
+}
 
 // FUNCTION: BFME2 0x0006ED55 size=26 name=?draw@Rva0006ED55@@UAEXXZ evidence=?:placeholder tier=B hypothesis:K
 
