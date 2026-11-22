@@ -70,6 +70,35 @@ void CostModifierUpgrade::upgradeRemovalImplementation()
 }
 
 // FUNCTION: BFME2 0x004B5AC0 size=140 name=?onCapture@Rva004B5AC0_Primary@@QAIXHPAVPlayer@@0@Z evidence=?:placeholder tier=B hypothesis:cohesion
+void CostModifierUpgrade::onCapture(Player *oldOwner, Player *newOwner)
+{
+	if (isAlreadyUpgraded())
+	{
+		const ModuleData *rawData = getModuleData();
+		const CostModifierUpgradeModuleData *data = static_cast<const CostModifierUpgradeModuleData *>(rawData);
+		CostModifierUpgradeModuleData *mutableData = const_cast<CostModifierUpgradeModuleData *>(data);
+		if (data->m_upgradeDiscount)
+		{
+			if (oldOwner)
+				oldOwner->removeProductionCostModifierByTemplate(mutableData, &getObject()->getTemplate()->getName());
+			if (newOwner)
+				newOwner->addProductionCostModifierByTemplate(mutableData, getObject()->getTemplate()->getName());
+		}
+		else
+		{
+			if (oldOwner)
+			{
+				oldOwner->removeProductionCostModifierByID(mutableData, getObject()->getID());
+				setUpgradeExecuted(false);
+			}
+			if (newOwner)
+			{
+				newOwner->rva002ACD09(mutableData, getObject()->getID());
+				setUpgradeExecuted(true);
+			}
+		}
+	}
+}
 
 // FUNCTION: BFME2 0x004B5B4C size=54 name=?upgradeImplementation@Rva004B5A65_Secondary@@QAEXXZ evidence=?:placeholder tier=B hypothesis:cohesion
 void CostModifierUpgrade::upgradeImplementation()

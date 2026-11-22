@@ -89,6 +89,35 @@ bool BuildAssistant::offersBuildCommand(ThingTemplate const *builder, ThingTempl
 // FUNCTION: BFME2 0x00391B08 size=475 name=?canMakeUnit@BuildAssistant@@UBE?AW4CanMakeType@@PAVObject@@PBVThingTemplate@@H@Z evidence=N:ledger tier=A
 
 // FUNCTION: BFME2 0x00391CE3 size=66 name=?isRemovableForConstruction@BuildAssistant@@QAE_NPAVObject@@@Z evidence=N:ledger tier=A
+bool BuildAssistant::isRemovableForConstruction(Object *obj)
+{
+	if (obj == NULL)
+		return false;
+
+	const ThingTemplate *tmpl = obj->getTemplate();
+	if (tmpl->isKindOf(KINDOF_INERT))
+		return false;
+
+	// Retail also refuses TAINT objects, a kind Zero Hour does not have.
+	if (tmpl->isKindOf(KINDOF_TAINT))
+		return false;
+
+	// all shrubbery can be removed
+	if (tmpl->isKindOf(KINDOF_SHRUBBERY))
+		return true;
+
+	// anything with a kindof marked as cleared by build can be removed
+	if (tmpl->isKindOf(KINDOF_CLEARED_BY_BUILD))
+		return true;
+
+	// rubble, scrap and dead units can be cleared
+	if (obj->isEffectivelyDead())
+		return true;
+
+	// not removable
+	return false;
+}
+
 // FUNCTION: BFME2 0x00391D25 size=553 name=?allow@Rva00391D25Filter@@UAE_NPAVObject@@@Z evidence=?:placeholder tier=A
 
 // FUNCTION: BFME2 0x00391F90 size=52 name=?reset@BuildAssistant@@UAEXXZ evidence=N:ledger tier=A
