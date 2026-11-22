@@ -91,7 +91,7 @@ bool BuildAssistant::offersBuildCommand(ThingTemplate const *builder, ThingTempl
 // FUNCTION: BFME2 0x00391CE3 size=66 name=?isRemovableForConstruction@BuildAssistant@@QAE_NPAVObject@@@Z evidence=N:ledger tier=A
 bool BuildAssistant::isRemovableForConstruction(Object *obj)
 {
-	if (!obj)
+	if (obj == NULL)
 		return false;
 
 	if (obj->isKindOf(KINDOF_INERT))
@@ -110,7 +110,11 @@ bool BuildAssistant::isRemovableForConstruction(Object *obj)
 		return true;
 
 	// rubble, scrap and dead units can be cleared
-	return obj->isEffectivelyDead();
+	if (obj->isEffectivelyDead())
+		return true;
+
+	// not removable
+	return false;
 }
 
 // FUNCTION: BFME2 0x00391D25 size=553 name=?allow@Rva00391D25Filter@@UAE_NPAVObject@@@Z evidence=?:placeholder tier=A
