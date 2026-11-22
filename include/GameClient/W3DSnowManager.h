@@ -18,6 +18,8 @@ public:
 	virtual void update();													// slot 10, 0x000949D9
 	virtual void updateIniSettings();										// slot 14, 0x00093ACB
 
+	Bool ReAcquireResources();												// 0x0009390F
+
 	unsigned char m_unk0x74[0x3C];											// +0x74..0xB0
 };
 typedef char W3DSnowManagerSize[(sizeof(W3DSnowManager) == 0xB0) ? 1 : -1];
