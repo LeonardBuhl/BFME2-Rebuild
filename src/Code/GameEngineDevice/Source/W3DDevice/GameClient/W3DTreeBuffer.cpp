@@ -7,6 +7,7 @@
 // Hypothesis rules: hypothesis:cohesion
 #include "GameClient/W3DPropBuffer.h"
 #include "GameLogic/PartitionManager.h"
+#include "WW3D2/RenderObjClass.h"
 // FUNCTION: BFME2 0x000EA1DB size=24 name=?Rva000EA1DBTopple@@YAXPAVRva000EA1DBTarget@@H@Z evidence=?:placeholder tier=B hypothesis:cohesion
 
 // FUNCTION: BFME2 0x000EA1F3 size=39 name=?rva000EA1F3@Rva000E6FC8@@QAEXXZ evidence=?:placeholder tier=A
@@ -78,6 +79,22 @@
 // FUNCTION: BFME2 0x000EDF46 size=136 name=?Convert_Color@DX8Wrapper@@SA?AVVector4@@I@Z evidence=N:ledger tier=A
 
 // FUNCTION: BFME2 0x000EDFCE size=124 name=?removeProp@W3DPropBuffer@@QAEXH@Z evidence=N:ledger tier=A
+void W3DPropBuffer::removeProp(Int id)
+{
+	for (Int i = 0; i < m_numProps; i++) {
+		if (m_props[i].id == id) {
+			m_props[i].location.set(0, 0, 0);
+			m_props[i].propType = -1;
+			if (m_props[i].m_robj) {
+				m_props[i].m_robj->Release_Ref();
+				m_props[i].m_robj = NULL;
+			}
+			m_props[i].bounds.Center = Vector3(0, 0, 0);
+			m_props[i].bounds.Radius = 1;
+			m_anythingChanged = true;
+		}
+	}
+}
 
 // FUNCTION: BFME2 0x000EE04A size=232 name=?rva000EE04A@W3DPropBuffer@@QAEXPBVCoord3D@@M@Z evidence=X:retail PE exports class Coord3D: ??0Matrix4D@@QAE@ABVCoord3D@@@Z tier=A
 
