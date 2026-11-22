@@ -94,19 +94,20 @@ bool BuildAssistant::isRemovableForConstruction(Object *obj)
 	if (obj == NULL)
 		return false;
 
-	if (obj->isKindOf(KINDOF_INERT))
+	const ThingTemplate *tmpl = obj->getTemplate();
+	if (tmpl->isKindOf(KINDOF_INERT))
 		return false;
 
 	// Retail also refuses TAINT objects, a kind Zero Hour does not have.
-	if (obj->isKindOf(KINDOF_TAINT))
+	if (tmpl->isKindOf(KINDOF_TAINT))
 		return false;
 
 	// all shrubbery can be removed
-	if (obj->isKindOf(KINDOF_SHRUBBERY))
+	if (tmpl->isKindOf(KINDOF_SHRUBBERY))
 		return true;
 
 	// anything with a kindof marked as cleared by build can be removed
-	if (obj->isKindOf(KINDOF_CLEARED_BY_BUILD))
+	if (tmpl->isKindOf(KINDOF_CLEARED_BY_BUILD))
 		return true;
 
 	// rubble, scrap and dead units can be cleared
