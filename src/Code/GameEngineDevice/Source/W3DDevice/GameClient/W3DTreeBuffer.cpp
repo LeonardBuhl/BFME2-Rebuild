@@ -5,6 +5,8 @@
 // Extents and edges are hypotheses; byte verification alone does not establish original TU boundaries.
 // Edges: left=unknown-rows right=rests-on:name+veto; proof_first=false
 // Hypothesis rules: hypothesis:cohesion
+#include "GameClient/W3DPropBuffer.h"
+#include "GameLogic/PartitionManager.h"
 // FUNCTION: BFME2 0x000EA1DB size=24 name=?Rva000EA1DBTopple@@YAXPAVRva000EA1DBTarget@@H@Z evidence=?:placeholder tier=B hypothesis:cohesion
 
 // FUNCTION: BFME2 0x000EA1F3 size=39 name=?rva000EA1F3@Rva000E6FC8@@QAEXXZ evidence=?:placeholder tier=A
@@ -80,6 +82,14 @@
 // FUNCTION: BFME2 0x000EE04A size=232 name=?rva000EE04A@W3DPropBuffer@@QAEXPBVCoord3D@@M@Z evidence=X:retail PE exports class Coord3D: ??0Matrix4D@@QAE@ABVCoord3D@@@Z tier=A
 
 // FUNCTION: BFME2 0x000EE132 size=41 name=?notifyShroudChanged@W3DPropBuffer@@QAEXXZ evidence=N:ledger tier=A
+// Marks every prop for a shroud recompute. Retail tests TheShroudManager where Zero Hour
+// tests ThePartitionManager; 0 and 1 are Zero Hour's OBJECTSHROUD_INVALID and
+// OBJECTSHROUD_CLEAR, which have no shared declaration yet.
+void W3DPropBuffer::notifyShroudChanged()
+{
+	for (Int i = 0; i < m_numProps; i++)
+		m_props[i].shroudStatus = TheShroudManager ? 0 : 1;
+}
 
 // FUNCTION: BFME2 0x000EE15B size=61 name=?rva000EE15B@W3DPropBuffer@@QAEXXZ evidence=?:placeholder tier=A
 
