@@ -70,11 +70,14 @@ class Api:
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
             "Content-Type": "application/json"})
+        headers = {}
         try:
             with self._opener().open(request, timeout=30) as response:
                 code, raw = response.status, response.read(LIMIT + 1)
+                headers = {k.lower(): response.headers.get(k) for k in ("X-Accepted-GitHub-Permissions", "X-GitHub-Request-Id") if response.headers and response.headers.get(k)}
         except urllib.error.HTTPError as exc:
             code, raw = exc.code, exc.read(LIMIT + 1)
+            headers = {k.lower(): exc.headers.get(k) for k in ("X-Accepted-GitHub-Permissions", "X-GitHub-Request-Id") if exc.headers and exc.headers.get(k)}
         except (urllib.error.URLError, OSError) as exc:
             raise TransientApiError(f"Expected a response from GitHub for {method} {path.split('?')[0]}. "
                                     f"Found a connection failure ({type(exc).__name__}).") from None
@@ -84,6 +87,7 @@ class Api:
             payload = json.loads(raw) if raw.strip() else None
         except ValueError:
             payload = None
+        self.last_headers = headers
         return code, payload
 
     _sleep = staticmethod(time.sleep)
@@ -109,6 +113,28 @@ class Api:
             raise ReadOnly(f"Expected no writes in dry-run mode. Found an attempted {method} {path}.")
         self.writes.append((method, path, body))
         return self._send(method, path, body)
+
+    def query(self, query, variables=None):
+        """Read-only GraphQL query (allowed in both dry-run and live mode) with transient retry."""
+        if not isinstance(query, str) or not query.lstrip().startswith("query"):
+            raise ApiError("Expected a read-only GraphQL query starting with 'query'.")
+        body = {"query": query, "variables": variables or {}}
+        for attempt in range(GET_ATTEMPTS):
+            try:
+                code, payload = self._send("POST", "graphql", body)
+            except TransientApiError:
+                if attempt + 1 >= GET_ATTEMPTS:
+                    raise
+                self._sleep(1 << attempt)
+                continue
+            if code == 200 and isinstance(payload, dict) and not payload.get("errors"):
+                return payload.get("data") or {}
+            if code not in RETRY_STATUSES or attempt + 1 >= GET_ATTEMPTS:
+                if code == 200 and isinstance(payload, dict) and payload.get("errors"):
+                    msg = printable((payload["errors"][0] or {}).get("message", ""), 160)
+                    raise ApiError(f"Expected GraphQL query to succeed. Found error: {msg}")
+                raise ApiError(f"Expected HTTP 200 from GraphQL. Found HTTP {code}.")
+            self._sleep(1 << attempt)
 
     def mutate(self, query, variables):
         """A GraphQL mutation (writes, so live only). Returns the data object or raises with GitHub's message."""

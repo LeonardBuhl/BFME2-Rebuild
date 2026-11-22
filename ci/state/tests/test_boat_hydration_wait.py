@@ -102,7 +102,9 @@ class BoatHydrationStepBehaviorTest(unittest.TestCase):
         script = extract_wait_script().replace("/proc/self/mountinfo", str(mountinfo_path))
         if timeout_s is not None:
             script = script.replace("deadline=$((SECONDS + 90))", f"deadline=$((SECONDS + {timeout_s}))")
+            script = script.replace("runner_grace=$((SECONDS + 15))", f"runner_grace=$((SECONDS + {min(timeout_s, 1)}))")
         env = dict(os.environ)
+        env["HOME"] = "/runner-home"
         with tempfile.TemporaryDirectory() as bindir:
             if fake_sleep is not None:
                 sleep_bin = Path(bindir) / "sleep"
@@ -205,6 +207,51 @@ class BoatHydrationStepBehaviorTest(unittest.TestCase):
             missing = Path(d) / "does-not-exist"
             proc = self._run_wait(missing)
         self.assertNotEqual(proc.returncode, 0)
+
+
+    def test_persistent_home_runner_alone_proceeds_after_grace(self):
+        only_runner = "\n".join([
+            "29 1 252:1 / / rw,relatime shared:1 - ext4 /dev/vda1 rw",
+            "1036 29 0:51 / /var/lib/ascii-lazy/retired/opt rw,relatime - fuse ascii-lazyfs-sys rw",
+            "1044 776 0:57 / /runner-home rw,relatime - fuse ascii-lazyfs rw",
+        ]) + "\n"
+        with tempfile.TemporaryDirectory() as d:
+            mp = Path(d) / "mountinfo"
+            mp.write_text(only_runner, encoding="utf-8")
+            proc = self._run_wait(mp, timeout_s=3)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("persistent lazy mount /runner-home", proc.stdout)
+
+    def test_home_runner_plus_compiler_mount_still_fails_closed(self):
+        stuck_both = "\n".join([
+            "29 1 252:1 / / rw,relatime shared:1 - ext4 /dev/vda1 rw",
+            "1044 776 0:57 / /runner-home rw,relatime - fuse ascii-lazyfs rw",
+            "1045 776 0:58 / /opt/boat-compiler rw,relatime - fuse ascii-lazyfs-sys rw",
+        ]) + "\n"
+        with tempfile.TemporaryDirectory() as d:
+            mp = Path(d) / "mountinfo"
+            mp.write_text(stuck_both, encoding="utf-8")
+            proc = self._run_wait(mp, timeout_s=1)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("/opt/boat-compiler", proc.stderr)
+
+
+
+    def test_compiler_mount_never_excused_even_if_home(self):
+        with tempfile.TemporaryDirectory() as td:
+            mountinfo = Path(td) / "mountinfo"
+            mountinfo.write_text(
+                "42 1 0:40 / /opt/boat-compiler rw,relatime - fuse.ascii-lazyfs ascii-lazyfs rw\n",
+                encoding="utf-8",
+            )
+            script = extract_wait_script().replace("/proc/self/mountinfo", str(mountinfo))
+            script = script.replace("deadline=$((SECONDS + 90))", "deadline=$((SECONDS + 2))")
+            script = script.replace("runner_grace=$((SECONDS + 15))", "runner_grace=$((SECONDS + 1))")
+            env = dict(os.environ)
+            env["HOME"] = "/opt/boat-compiler"
+            proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=15)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("/opt/boat-compiler", proc.stderr)
 
 
 if __name__ == "__main__":

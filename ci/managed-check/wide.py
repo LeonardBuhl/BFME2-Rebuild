@@ -9,7 +9,7 @@ from time import monotonic
 from types import SimpleNamespace
 
 from common import HEX64, PIN, digest, encoded, read, validate_binding, write
-from compare import difference, make_report, native_commands, protected_judge, native_blockers, unexpected_symbol_pairs, measure_batch, measure_pair, memoized_projection
+from compare import difference, make_report, native_commands, protected_judge, native_blockers, emitted_row_pairs, unexpected_symbol_pairs, measure_batch, measure_pair, memoized_projection
 from emitted_data import record_pairs
 from compact_matrix import make_compact, join_compact
 from diff_scope import diff_lines
@@ -156,6 +156,9 @@ def sanitize_outcome(raw, path, changed, *, judge=None, obj=None, baseline=None,
         pairs = unexpected_symbol_pairs(raw, judge=judge, obj=obj, baseline=baseline)
         if pairs:
             verdict["unexpected_symbols"] = pairs
+        epairs = emitted_row_pairs(raw, baseline=baseline)
+        if epairs:
+            verdict["emitted_rows"] = epairs
     if raw.get("error"):
         located = safe_diagnostics(path, raw["error"], tuple(sorted(changed)))
         diagnostics = "\n".join(line for line in located.splitlines() if line.split("(", 1)[0] in changed)

@@ -227,5 +227,53 @@ class Cut2OptimizationTests(unittest.TestCase):
                     recovery_broker.anchor(tmp)
 
 
+
+
+class EmittedRowMessageTests(unittest.TestCase):
+    def test_emitted_row_blocker_produces_actionable_hint(self):
+        old_table = {
+            "src/Code/A.cpp": {
+                "object_verified": True, "error": None, "gates": [],
+                "expected": [], "verification_blockers": [], "unexpected_code": [],
+                "rows": [{"rva": "0x00100000", "status": "MISSING", "pct": 0.0}],
+            }
+        }
+        new_table = {
+            "src/Code/A.cpp": {
+                "object_verified": False, "error": None, "gates": [],
+                "expected": [{"rva": "0x00100000", "status": "MISMATCH"}],
+                "verification_blockers": [], "unexpected_code": [],
+                "rows": [{"rva": "0x00100000", "status": "MISMATCH", "pct": 87.5}],
+            }
+        }
+        _, rules, hints = compare.reduction(compare.index(old_table), compare.index(new_table))
+        self.assertIn("emitted-row", rules)
+        self.assertTrue(any("src/Code/A.cpp at 0x00100000: emitted function MISMATCH (87.5%" in h for h in hints),
+                        f"Expected actionable emitted-row hint, got {hints!r}")
+
+
+
+    def test_emitted_row_blocker_falls_back_to_expected_when_not_in_rows(self):
+        old_table = {
+            "src/Code/B.cpp": {
+                "object_verified": True, "error": None, "gates": [],
+                "expected": [], "verification_blockers": [], "unexpected_code": [],
+                "rows": [],
+            }
+        }
+        new_table = {
+            "src/Code/B.cpp": {
+                "object_verified": False, "error": None, "gates": [],
+                "expected": [{"rva": "0x00200000", "status": "MISMATCH", "symbol": "Foo::bar"}],
+                "verification_blockers": [], "unexpected_code": [],
+                "rows": [],
+            }
+        }
+        _, rules, hints = compare.reduction(compare.index(old_table), compare.index(new_table))
+        self.assertIn("emitted-row", rules)
+        self.assertTrue(any("src/Code/B.cpp at 0x00200000 `Foo::bar`: emitted function MISMATCH" in h for h in hints),
+                        f"Expected fallback emitted-row hint, got {hints!r}")
+
+
 if __name__ == "__main__":
     unittest.main()

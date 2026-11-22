@@ -30,7 +30,7 @@ jobs:
     concurrency:
       group: >-
         ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-        && 'bfme-admission-retry' || format('bfme-admission-{0}', github.run_id) }}
+        && 'bfme-admission-retry' || (github.event_name == 'pull_request_target' && format('bfme-admission-pr-{0}', github.event.pull_request.number) || format('bfme-admission-{0}', github.run_id)) }}
       cancel-in-progress: false
     permissions:
       contents: write

@@ -282,7 +282,6 @@ class ProtectedPaths(unittest.TestCase):
             self.assertEqual(decision["stage"], "hold")
 
 
-@unittest.skipUnless(receipts_match_checkout(), "the captured receipts were produced by ci/managed-check at 879a5be4")
 class ForkLanding(unittest.TestCase):
     def prepare(self, tmp, api):
         code, _ = quiet(lander.run, ["select", tmp + "/w"], env(pr="2", mode="live"), api=api, config=NO_EXCEPTIONS)

@@ -26,11 +26,14 @@ being reserved now: main never moves backwards, so an older base can never be me
 import base64
 import datetime
 import json
+import random
+import time
 
 LEDGER_BRANCH = "admission-ledger"
 LEDGER_FILE = "ledger.json"
-ATTEMPTS = 4
-MAX_REISSUES = 2
+ATTEMPTS = 12
+MAX_REISSUES = 4
+_sleep = time.sleep
 
 
 class LedgerError(Exception):
@@ -114,26 +117,34 @@ def reserve(api, limits, author, number, head, base, run, attempt, clock=None, t
     total_key, authors_key = ("total", "authors") if kind == "narrow" else ("wide_total", "wide_authors")
     ensure(api)
     today, yesterday = days(clock)
-    for _ in range(ATTEMPTS):
+    for attempt_idx in range(ATTEMPTS):
         data, sha = _read(api)
         item = _match(data, number, head, base)
         if item:
             exact = item.get("tree") == tree and item.get("kind") == kind and item.get("author") == author
             return "already" if exact else "binding-mismatch"
-        if kind != "trusted-narrow":
+        already_paid_today = any(
+            r.get("day") == today
+            and r.get("number") == number and r.get("head") == head and r.get("kind") == kind
+            and r.get("author") == author
+            for r in data["reservations"]
+        )
+        if kind != "trusted-narrow" and not already_paid_today:
             counts = data["days"].setdefault(today, {"total": 0, "authors": {}, "wide_total": 0, "wide_authors": {}})
             key = str(author)
             if counts[total_key] >= limits["daily_total"] or counts[authors_key].get(key, 0) >= limits["daily_per_author"]:
                 return "over-budget"
             counts[total_key] += 1
             counts[authors_key][key] = counts[authors_key].get(key, 0) + 1
-        data["reservations"].append({"day": today, "number": number, "author": author, "head": head, "base": base,
-                                     "tree": tree, "kind": kind,
+        data["reservations"].append({"day": today, "number": number, "author": author,
+                                     "head": head, "base": base, "tree": tree, "kind": kind,
                                      "admitted_by": {"run": str(run), "attempt": str(attempt)}, "claimed_by": None})
         _prune(data, yesterday, base)
         if _write(api, data, sha, f"Reserve #{number} {head[:12]} on {base[:12]}"):
             return "reserved"
-    raise LedgerError("Expected a ledger update within four attempts. Found repeated concurrent changes.")
+        if attempt_idx + 1 < ATTEMPTS and getattr(api, "live", False) and hasattr(api, "opener"):
+            _sleep(0.15 * (attempt_idx + 1) + random.uniform(0, 0.15))
+    raise LedgerError(f"Expected a ledger update within {ATTEMPTS} attempts. Found repeated concurrent changes.")
 
 
 def find(api, number, head, base, clock=None):
@@ -149,7 +160,7 @@ def claim(api, number, head, base, run, attempt, clock=None, tree=None, *, kind=
     'claimed-by-other'.
     """
     mine = {"run": str(run), "attempt": str(attempt)}
-    for _ in range(ATTEMPTS):
+    for attempt_idx in range(ATTEMPTS):
         data, sha = _read(api)
         item = _match(data, number, head, base)
         if not item:
@@ -167,13 +178,15 @@ def claim(api, number, head, base, run, attempt, clock=None, tree=None, *, kind=
         item["claimed_by"] = mine
         if _write(api, data, sha, f"Claim #{number} {head[:12]} by run {run}/{attempt}"):
             return "claimed"
-    raise LedgerError("Expected a ledger claim within four attempts. Found repeated concurrent changes.")
+        if attempt_idx + 1 < ATTEMPTS and getattr(api, "live", False) and hasattr(api, "opener"):
+            _sleep(0.15 * (attempt_idx + 1) + random.uniform(0, 0.15))
+    raise LedgerError(f"Expected a ledger claim within {ATTEMPTS} attempts. Found repeated concurrent changes.")
 
 
 def refresh_issuer(api, number, head, base, run, attempt):
     """Give an unclaimed reservation to this admission run. 'refreshed', 'claimed' (leave it) or 'missing'."""
     mine = {"run": str(run), "attempt": str(attempt)}
-    for _ in range(ATTEMPTS):
+    for attempt_idx in range(ATTEMPTS):
         data, sha = _read(api)
         item = _match(data, number, head, base)
         if not item:
@@ -185,7 +198,9 @@ def refresh_issuer(api, number, head, base, run, attempt):
         item["admitted_by"] = mine
         if _write(api, data, sha, f"Re-issue #{number} {head[:12]} to run {run}/{attempt}"):
             return "refreshed"
-    raise LedgerError("Expected a ledger update within four attempts. Found repeated concurrent changes.")
+        if attempt_idx + 1 < ATTEMPTS and getattr(api, "live", False) and hasattr(api, "opener"):
+            _sleep(0.15 * (attempt_idx + 1) + random.uniform(0, 0.15))
+    raise LedgerError(f"Expected a ledger update within {ATTEMPTS} attempts. Found repeated concurrent changes.")
 
 
 def reissue_unmeasured(api, limits, number, head, base, claimed_by, run, attempt, clock=None):
@@ -199,7 +214,7 @@ def reissue_unmeasured(api, limits, number, head, base, claimed_by, run, attempt
     """
     mine = {"run": str(run), "attempt": str(attempt)}
     today, _ = days(clock)
-    for _ in range(ATTEMPTS):
+    for attempt_idx in range(ATTEMPTS):
         data, sha = _read(api)
         item = _match(data, number, head, base)
         if not item:
@@ -212,19 +227,14 @@ def reissue_unmeasured(api, limits, number, head, base, claimed_by, run, attempt
         kind = item.get("kind")
         if kind not in ("narrow", "wide", "trusted-narrow"):
             raise LedgerError(f"Expected kind narrow, wide or trusted-narrow. Found {kind!r}.")
-        if kind != "trusted-narrow":
-            if not limits:
-                return "over-budget"
-            total_key, authors_key = ("total", "authors") if kind == "narrow" else ("wide_total", "wide_authors")
-            counts = data["days"].setdefault(today, {"total": 0, "authors": {}, "wide_total": 0, "wide_authors": {}})
-            key = str(item.get("author"))
-            if counts[total_key] >= limits["daily_total"] or counts[authors_key].get(key, 0) >= limits["daily_per_author"]:
-                return "over-budget"
-            counts[total_key] += 1
-            counts[authors_key][key] = counts[authors_key].get(key, 0) + 1
+        if kind != "trusted-narrow" and not limits:
+            return "over-budget"
+        # Infrastructure faults never double-charge the daily quota already paid on initial reserve().
         item["reissues"] = used + 1
         item["claimed_by"] = None
         item["admitted_by"] = mine
         if _write(api, data, sha, f"Re-issue #{number} {head[:12]} after an unmeasured run ({used + 1} of {MAX_REISSUES})"):
             return "reissued"
-    raise LedgerError("Expected a ledger update within four attempts. Found repeated concurrent changes.")
+        if attempt_idx + 1 < ATTEMPTS and getattr(api, "live", False) and hasattr(api, "opener"):
+            _sleep(0.15 * (attempt_idx + 1) + random.uniform(0, 0.15))
+    raise LedgerError(f"Expected a ledger update within {ATTEMPTS} attempts. Found repeated concurrent changes.")

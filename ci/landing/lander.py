@@ -20,6 +20,7 @@ from pathlib import Path
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
+import threading
 import datetime
 import time
 
@@ -48,13 +49,19 @@ REMEASURE_EVENT = "bfme-remeasure"  # both check workflows measure the PR on cur
 LANDED_EVENT = "bfme-landed"        # state and progress workflows run after a landing
 NEXT_EVENT = "bfme-land-next"       # this workflow takes the next pull request
 ADMIT_REQUEST_EVENT = "bfme-admit-request"  # admission.yml reserves and starts a measurement of a fork
+SOURCE_RECHECK_EVENT = "bfme-source-recheck"  # hosted G1-G8 source rules only (0 Boat VMs)
 MEASURE_WAIT_SECONDS = 1800         # wide changes measured 744 to 978 s
 LAND_SETTLE_SECONDS = 180           # bounded wait for just-completed runs on stage == land
 MAX_PARALLEL_REMEASURES = 5         # fan out stale-ready PRs without holding the global lock
 POLL_SECONDS = 20
-MAX_OPEN_PULLS = 300
+MAX_OPEN_PULLS = 1000
+DISJOINT_TU_PREFIX = "src/Code/"
+DISJOINT_TU_SUFFIXES = (".c", ".cpp")
+MAX_ANCESTOR_AHEAD = 32
+HEADER_PRIORITY_WAIT_SECONDS = 720
 TRAILER = "Landed by the BFME II landing workflow"
 # Reconciliation reads only the body this workflow writes (after the title, which a pull request author chooses).
+MAIN_MARKER_RE = re.compile(r"\(main ([0-9a-f]{12})\)")
 MEASURED_LINE = re.compile(r"Measured on main ([0-9a-f]{40}), head ([0-9a-f]{40}), tree ([0-9a-f]{40})\.")
 NUMBER_LINE = re.compile(r"Pull request #([1-9][0-9]{0,8})\.")
 TRAILER_LINE = re.compile(re.escape(TRAILER) + r", run [0-9]{1,20}\.")
@@ -163,28 +170,311 @@ def admission_status(api, head):
     return max(found, key=lambda item: item["id"]) if found else None
 
 
-def changed_files(api, number):
+MAX_ANCESTOR_AGE_SECONDS = 20 * 3600
+BUILD_NEUTRAL_PREFIXES = (
+    "docs/", "worklist/", "ci/nightly/", "ci/progress/", "ci/alarms/",
+    "ci/public-text/", "ci/managed-check/tests/", "ci/landing/tests/", "ci/admission/tests/",
+)
+BUILD_NEUTRAL_WORKFLOWS = frozenset({
+    ".github/workflows/nightly.yml", ".github/workflows/nightly-trial.yml",
+    ".github/workflows/progress.yml", ".github/workflows/ci-tests.yml",
+})
+
+
+def _status_fresh_enough(status_obj, max_age_seconds, now=None):
+    if not isinstance(status_obj, dict):
+        return False
+    ts = status_obj.get("created_at") or ""
+    if not ts:
+        return True
+    try:
+        created = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    ref_now = now if now is not None else datetime.datetime.now(datetime.timezone.utc)
+    return (ref_now - created).total_seconds() <= max_age_seconds
+
+
+def _is_build_neutral_path(name):
+    return (isinstance(name, str) and bool(name)
+            and (name.startswith(BUILD_NEUTRAL_PREFIXES)
+                 or name in BUILD_NEUTRAL_WORKFLOWS
+                 or ("/" not in name and name.endswith(".md"))))
+
+
+def _is_disjoint_tu_path(name):
+    return (isinstance(name, str)
+            and name.startswith(DISJOINT_TU_PREFIX)
+            and name.lower().endswith(DISJOINT_TU_SUFFIXES))
+
+
+def changed_files_detail(api, number):
     names = []
+    all_simple_tu = True
     for page in range(1, 31):
         entries = api.call(f"pulls/{number}/files?per_page=100&page={page}")
         if not isinstance(entries, list):
             raise Failed("file-list", "the pull request's changed file list", "a different response")
         for item in entries:
-            names.append(item.get("filename", ""))
+            fname = item.get("filename", "")
+            names.append(fname)
             if item.get("previous_filename"):
                 names.append(item["previous_filename"])
+                all_simple_tu = False
+            elif item.get("status") not in {"modified", "added"} or not _is_disjoint_tu_path(fname):
+                all_simple_tu = False
         if len(entries) < 100:
-            return names
+            return names, bool(names) and all_simple_tu
     raise Held("too-many-files", "at most 3000 changed files", "more", final=True)
 
 
-def evaluate(api, number, main, config):
+def changed_files(api, number):
+    names, _ = changed_files_detail(api, number)
+    return names
+
+
+def extract_main_prefix(status_obj):
+    if not status_obj or (status_obj.get("creator") or {}).get("id") != lr.BOT_ID:
+        return None
+    m = MAIN_MARKER_RE.search(status_obj.get("description") or "")
+    return m.group(1) if m else None
+
+
+def resolve_disjoint_ancestor(api, prefix12, main, pr_files, compare_cache=None, cache_lock=None):
+    """Return full 40-hex ancestor SHA iff main..ancestor only modified disjoint src/Code/*.c(pp) files."""
+    if not prefix12 or not re.fullmatch(r"[0-9a-f]{12}", prefix12) or not pr_files:
+        return None
+    if not all(_is_disjoint_tu_path(name) for name in pr_files):
+        return None
+    cache_key = (prefix12, main)
+    cmp = None
+    hit = False
+    if compare_cache is not None:
+        if cache_lock is not None:
+            with cache_lock:
+                if cache_key in compare_cache:
+                    cmp, hit = compare_cache[cache_key], True
+        elif cache_key in compare_cache:
+            cmp, hit = compare_cache[cache_key], True
+    if not hit:
+        try:
+            cmp = api.call(f"compare/{prefix12}...{main}")
+        except ApiError:
+            cmp = None
+        if compare_cache is not None:
+            if cache_lock is not None:
+                with cache_lock:
+                    compare_cache[cache_key] = cmp
+            else:
+                compare_cache[cache_key] = cmp
+    if not isinstance(cmp, dict):
+        return None
+    if cmp.get("status") != "ahead" or cmp.get("behind_by") != 0:
+        return None
+    ahead_by = cmp.get("ahead_by")
+    if type(ahead_by) is not int or not 1 <= ahead_by <= MAX_ANCESTOR_AHEAD:
+        return None
+    base_sha = (cmp.get("base_commit") or {}).get("sha", "")
+    merge_base_sha = (cmp.get("merge_base_commit") or {}).get("sha", "")
+    if not HEX40.fullmatch(base_sha) or not base_sha.startswith(prefix12) or merge_base_sha != base_sha:
+        return None
+    intervening = cmp.get("files")
+    if not isinstance(intervening, list) or not (0 < len(intervening) < 300):
+        return None
+    intervening_lower = set()
+    for item in intervening:
+        if not isinstance(item, dict):
+            return None
+        fname = item.get("filename", "")
+        prev = item.get("previous_filename")
+        if _is_build_neutral_path(fname) and (not prev or _is_build_neutral_path(prev)):
+            continue
+        if (item.get("status") != "modified"
+                or prev
+                or not _is_disjoint_tu_path(fname)):
+            return None
+        intervening_lower.add(fname.lower())
+    pr_lower = {name.lower() for name in pr_files}
+    if intervening_lower & pr_lower:
+        return None
+    return base_sha
+
+
+def blob_sha_in_tree(api, tree_sha, rel_path, tree_cache=None):
+    """Walk git/trees/{sha} path segments to find the exact blob SHA of rel_path in tree_sha."""
+    if not HEX40.fullmatch(tree_sha) or not rel_path or rel_path.startswith("/") or ".." in rel_path.split("/"):
+        return None
+    parts = rel_path.split("/")
+    cur = tree_sha
+    for idx, seg in enumerate(parts):
+        if tree_cache is not None and cur in tree_cache:
+            entries = tree_cache[cur]
+        else:
+            doc = api.call(f"git/trees/{cur}")
+            if not isinstance(doc, dict) or doc.get("truncated") is True or not isinstance(doc.get("tree"), list):
+                return None
+            entries = {item.get("path"): item for item in doc["tree"] if isinstance(item, dict)}
+            if tree_cache is not None:
+                tree_cache[cur] = entries
+        entry = entries.get(seg)
+        if not entry:
+            return None
+        want_type = "blob" if idx == len(parts) - 1 else "tree"
+        if entry.get("type") != want_type or not HEX40.fullmatch(entry.get("sha", "")):
+            return None
+        cur = entry["sha"]
+    return cur
+
+
+OPEN_PULLS_QUERY = """query($owner: String!, $name: String!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: OPEN, baseRefName: "main", orderBy: {field: CREATED_AT, direction: ASC}, first: 50, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        id
+        title
+        state
+        isDraft
+        authorAssociation
+        mergeable
+        baseRefName
+        headRefName
+        headRefOid
+        author { login ... on User { databaseId } ... on Bot { databaseId } }
+        headRepository { databaseId }
+        baseRepository { databaseId }
+        labels(first: 50) { nodes { name } }
+        files(first: 100) { totalCount nodes { path changeType } }
+        commits(last: 1) {
+          nodes {
+            commit {
+              oid
+              status {
+                contexts {
+                  context
+                  state
+                  description
+                  targetUrl
+                  createdAt
+                  creator { ... on User { databaseId } ... on Bot { databaseId } }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}"""
+
+
+def _gql_to_prefetched(node):
+    if not isinstance(node, dict) or not isinstance(node.get("number"), int):
+        return None
+    mergeable_map = {"MERGEABLE": True, "CONFLICTING": False, "UNKNOWN": None}
+    head_repo_id = (node.get("headRepository") or {}).get("databaseId")
+    base_repo_id = (node.get("baseRepository") or {}).get("databaseId")
+    pr = {
+        "number": node["number"],
+        "node_id": node.get("id"),
+        "title": node.get("title") or "",
+        "state": (node.get("state") or "").lower(),
+        "draft": node.get("isDraft"),
+        "author_association": node.get("authorAssociation"),
+        "mergeable": mergeable_map.get(node.get("mergeable")),
+        "user": {"login": (node.get("author") or {}).get("login"), "id": (node.get("author") or {}).get("databaseId")},
+        "base": {"ref": node.get("baseRefName") or "", "repo": {"id": base_repo_id} if base_repo_id else {}},
+        "head": {
+            "sha": node.get("headRefOid") or "",
+            "ref": node.get("headRefName") or "",
+            "repo": {"id": head_repo_id} if head_repo_id else None,
+        },
+        "labels": [{"name": item["name"]} for item in ((node.get("labels") or {}).get("nodes") or ())
+                   if isinstance(item, dict) and item.get("name")],
+    }
+    statuses, bot_statuses = {}, {}
+    commit_nodes = (node.get("commits") or {}).get("nodes") or ()
+    commit_obj = (commit_nodes[0].get("commit") if commit_nodes else None) or {}
+    commit_oid = commit_obj.get("oid")
+    status_obj = (commit_obj.get("status") or {}) if (not commit_oid or commit_oid == node.get("headRefOid")) else {}
+    for idx, ctx in enumerate(status_obj.get("contexts") or ()):
+        if not isinstance(ctx, dict) or not isinstance(ctx.get("context"), str):
+            continue
+        creator_id = (ctx.get("creator") or {}).get("databaseId")
+        item = {
+            "id": idx + 1,
+            "context": ctx["context"],
+            "state": (ctx.get("state") or "").lower(),
+            "description": ctx.get("description") or "",
+            "target_url": ctx.get("targetUrl") or "",
+            "created_at": ctx.get("createdAt") or "",
+            "creator": {"id": creator_id} if creator_id is not None else {},
+        }
+        statuses[ctx["context"]] = item
+        if creator_id == lr.BOT_ID:
+            bot_statuses[ctx["context"]] = item
+    files_node = node.get("files")
+    files, all_simple_tu = None, False
+    if isinstance(files_node, dict):
+        total = files_node.get("totalCount")
+        fnodes = files_node.get("nodes") or ()
+        if isinstance(total, int) and total <= 100 and len(fnodes) == total:
+            if not any(isinstance(f, dict) and f.get("changeType") == "RENAMED" for f in fnodes):
+                files = [f.get("path", "") for f in fnodes if isinstance(f, dict)]
+                all_simple_tu = bool(files) and all(
+                    isinstance(f, dict)
+                    and f.get("changeType") in {"MODIFIED", "ADDED"}
+                    and _is_disjoint_tu_path(f.get("path", ""))
+                    for f in fnodes
+                )
+    return {
+        "number": node["number"],
+        "pr": pr,
+        "statuses": statuses,
+        "bot_statuses": bot_statuses,
+        "files": files,
+        "all_simple_tu": all_simple_tu,
+    }
+
+
+def fetch_open_pulls_batch(api):
+    """Fetch up to MAX_OPEN_PULLS open PRs + statuses + files via GraphQL (50/call). Returns None on fallback."""
+    if not hasattr(api, "query"):
+        return None
+    owner, name = REPO.split("/", 1)
+    results = []
+    cursor = None
+    pages = (MAX_OPEN_PULLS + 49) // 50
+    try:
+        for _ in range(pages):
+            data = api.query(OPEN_PULLS_QUERY, {"owner": owner, "name": name, "cursor": cursor})
+            conn = ((data or {}).get("repository") or {}).get("pullRequests")
+            if not isinstance(conn, dict):
+                return None
+            for node in conn.get("nodes") or ():
+                parsed = _gql_to_prefetched(node)
+                if parsed is not None:
+                    results.append(parsed)
+                if len(results) >= MAX_OPEN_PULLS:
+                    return results
+            page_info = conn.get("pageInfo") or {}
+            if not page_info.get("hasNextPage") or not page_info.get("endCursor"):
+                break
+            cursor = page_info["endCursor"]
+        return results
+    except ApiError:
+        return None
+
+
+def evaluate(api, number, main, config, *, prefetched=None, compare_cache=None, cache_lock=None):
     """Return a decision dict: stage land | remeasure | hold, with every named reason found."""
-    pr = api.call(f"pulls/{number}")
+    pr = prefetched["pr"] if prefetched is not None else api.call(f"pulls/{number}")
     head = (pr.get("head") or {}).get("sha", "")
     decision = {"number": number, "head": head, "title": printable(pr.get("title", ""), 120),
                 "author": (pr.get("user") or {}).get("login"), "node_id": pr.get("node_id"),
-                "stage": "hold", "reasons": [], "checks": {}}
+                "stage": "hold", "reasons": [], "checks": {}, "measured_base": main,
+                "ancestor_landing": False, "header_change": False, "pr_files": []}
     reasons = decision["reasons"]
 
     def hold(code, expected, found, final=False):
@@ -213,7 +503,14 @@ def evaluate(api, number, main, config):
     decision["has_ledger_label"] = any(label.get("name") == LEDGER_REQUEST_LABEL for label in pr.get("labels") or ())
     if any(label.get("name") == HOLD_LABEL for label in pr.get("labels") or ()):
         hold("hold-label", f"no {HOLD_LABEL} label", f"the {HOLD_LABEL} label, set by a maintainer")
-    statuses, bot_statuses = read_statuses_all(api, head)
+    if prefetched is not None:
+        statuses, bot_statuses = prefetched["statuses"], prefetched["bot_statuses"]
+        # If a non-bot actor overwrote a bot-owned context in GraphQL's latest-only view, re-read full REST history.
+        bot_sensitive = (ADMISSION_CONTEXT, HEADER_RULES_CONTEXT, BOAT, RULES, INLINE, LANDING_CONTEXT)
+        if any(ctx in statuses and ctx not in bot_statuses for ctx in bot_sensitive):
+            statuses, bot_statuses = read_statuses_all(api, head)
+    else:
+        statuses, bot_statuses = read_statuses_all(api, head)
     adm_status = bot_statuses.get(ADMISSION_CONTEXT) or {}
     if not head_repo:
         hold("head-repository-missing", "the pull request's source repository",
@@ -231,7 +528,11 @@ def evaluate(api, number, main, config):
         hold("awaiting-admission", "an admission of this commit to the compiler check",
              "none yet. Changes to source files only are admitted automatically within a daily limit; other "
              "changes wait for a maintainer (label boat-ok); you do not need to do anything")
-    files = changed_files(api, number)
+    if prefetched is not None and prefetched.get("files") is not None:
+        files, all_simple_tu = prefetched["files"], prefetched["all_simple_tu"]
+    else:
+        files, all_simple_tu = changed_files_detail(api, number)
+    decision["pr_files"] = list(files)
     if any(name.startswith(".github/") for name in files):
         hold("workflow-change", "no change under .github/", "a workflow change; a maintainer merges those by hand", True)
     protected = sorted({name.split("/", 1)[0] + "/" for name in files if name.startswith(PROTECTED_PATHS)})
@@ -240,6 +541,8 @@ def evaluate(api, number, main, config):
         hold("protected-path", "changes only outside " + ", ".join(PROTECTED_PATHS),
              f"a change under {', '.join(protected)}; a maintainer merges those by hand", True)
     header_change = any(name.startswith("include/") for name in files)
+    decision["header_change"] = header_change
+    decision["boat_status"] = bot_statuses.get(BOAT)
     if header_change and config.get("auto_headers"):
         rules = bot_statuses.get(HEADER_RULES_CONTEXT) or {}
         text = rules.get("description") or ""
@@ -288,14 +591,19 @@ def evaluate(api, number, main, config):
     # GitHub does not recompute "mergeable" when main moves. A compiler check that passed on this exact main composed
     # this head onto it (unique ancestor, three-way merge), so an older "false" does not hold it; the merge itself is
     # still GitHub's and refuses a real conflict.
-    if pr.get("mergeable") is False and classify(statuses.get(BOAT), main) != "fresh-success":
+    if pr.get("mergeable") is False and classify(bot_statuses.get(BOAT), main) != "fresh-success":
         hold("merge-conflict", "a pull request that merges cleanly into main",
              "a conflict; merge or rebase main into the branch", True)
-    decision["landing_status"] = statuses.get(LANDING_CONTEXT)
+    decision["landing_status"] = bot_statuses.get(LANDING_CONTEXT)
+    prior_landing = decision["landing_status"] or {}
+    if (prior_landing.get("state") == "failure"
+            and (prior_landing.get("description") or "").startswith("Held: merge-forbidden.")):
+        hold("merge-forbidden", "an updated head after GitHub refused the automated merge (HTTP 403)",
+             "same commit that got HTTP 403; update or rebase your branch onto main and push", True)
     stale = False
     required = REQUIRED + ((INLINE,) if INLINE_VIRTUAL_POLICY == "required" else ())
     for context in (BOAT, RULES, INLINE):
-        kind = classify(statuses.get(context), main)
+        kind = classify(bot_statuses.get(context), main)
         decision["checks"][context] = kind
         if context == INLINE and context not in required:
             if kind == "fresh-failure":
@@ -323,16 +631,45 @@ def evaluate(api, number, main, config):
             hold("measuring", f"{context} finished", "pending")
         elif (context == BOAT and kind == "missing" and decision["fork"]
               and pr.get("author_association") not in {"OWNER", "MEMBER", "COLLABORATOR"}):
-            # The compiler check runs a contributor's commit only when a maintainer starts it; boat-ok on an
-            # earlier commit does not start it for a new push.
-            hold("awaiting-readmission", f"a maintainer to admit commit {head[:12]} (remove and add the boat-ok label)",
-                 "no compiler check for this commit yet. A maintainer reads each new commit from a contributor "
-                 "before the compiler runs it; you do not need to do anything")
+            if config.get("auto_admission") or decision.get("rule_admitted"):
+                hold("awaiting-measurement", f"{BOAT} on head {head[:12]}",
+                     "no compiler check for this commit yet; automatic admission starts it, you do not need to do anything")
+            else:
+                # Without automatic admission, a maintainer admits each new contributor commit via boat-ok.
+                hold("awaiting-readmission", f"a maintainer to admit commit {head[:12]} (remove and add the boat-ok label)",
+                     "no compiler check for this commit yet. A maintainer reads each new commit from a contributor "
+                     "before the compiler runs it; you do not need to do anything")
         else:
             hold("no-status", f"{context} from GitHub Actions on head {head[:12]}", kind)
     if not reasons:
+        if (stale and not decision.get("header_stale") and not header_change and all_simple_tu
+                and pr.get("mergeable") is not False
+                and decision["checks"].get(BOAT) == "stale-success"
+                and decision["checks"].get(INLINE) != "stale-failure"):
+            boat_st = bot_statuses.get(BOAT)
+            boat_prefix = extract_main_prefix(boat_st) if _status_fresh_enough(boat_st, MAX_ANCESTOR_AGE_SECONDS) else None
+            if boat_prefix:
+                ancestor = resolve_disjoint_ancestor(api, boat_prefix, main, files,
+                                                     compare_cache=compare_cache, cache_lock=cache_lock)
+                if ancestor:
+                    if decision["checks"].get(RULES) == "fresh-success":
+                        # Repo-wide G1-G8 (including G7 one-definition) passed on current main, and Boat
+                        # compiled this exact TU against a disjoint ancestor with identical headers/configs.
+                        decision["stage"] = "land"
+                        decision["measured_base"] = ancestor
+                        decision["ancestor_landing"] = True
+                        inline_st = bot_statuses.get(INLINE)
+                        inline_ok = (inline_st
+                                     and inline_st.get("state") == "success"
+                                     and marker(ancestor) in (inline_st.get("description") or ""))
+                        decision["inline"] = "success" if inline_ok else "pending"
+                        return decision
+                    if decision["checks"].get(RULES) == "stale-success":
+                        # Refresh only hosted source rules on current main (0 Boat VMs) to prove G7.
+                        decision["source_recheck_only"] = True
+                        decision["measured_base"] = ancestor
         decision["stage"] = "remeasure" if stale or decision.get("header_stale") else "land"
-        decision["inline"] = statuses.get(INLINE, {}).get("state") if decision["checks"][INLINE] == "fresh-success" else "pending"
+        decision["inline"] = bot_statuses.get(INLINE, {}).get("state") if decision["checks"][INLINE] == "fresh-success" else "pending"
     return decision
 
 
@@ -427,14 +764,58 @@ def inline_options(inline):
     return {"inline_required": False}
 
 
-def runs_for(api, binding, inline):
-    """Exact producing runs, read by the protected landing_read.start_runs."""
+def _verify_single_run(api, context, status_obj, binding):
+    if not status_obj or status_obj.get("state") != "success":
+        raise Held("run-binding", f"{context} success on head {binding['head'][:12]}",
+                   str((status_obj or {}).get("state") or "missing"))
+    if (status_obj.get("creator") or {}).get("id") != lr.BOT_ID:
+        raise Held("run-binding", f"{context} from GitHub Actions", "a different writer")
+    target = lr.URL.fullmatch(status_obj.get("target_url") or "")
+    if not target or marker(binding["base"]) not in (status_obj.get("description") or ""):
+        raise Held("run-binding", f"{context} linked to main {binding['base'][:12]}", "stale or missing link")
+    run_id = target[1]
+    run = api.call("actions/runs/" + run_id)
+    event = run.get("event")
+    run_sha = {"pull_request_target": binding["head"], "repository_dispatch": binding["base"]}.get(event)
+    expected_paths = (lr.FLOW[context], lr.FLOW[BOAT]) if context == RULES else (lr.FLOW[context],)
+    if (str(run.get("id")) != run_id or run.get("path") not in expected_paths
+            or run_sha is None or run.get("head_sha") != run_sha
+            or (run.get("repository") or {}).get("id") != REPO_ID
+            or run.get("status") != "completed" or run.get("conclusion") != "success"
+            or not lr.NUMBER.fullmatch(str(run.get("run_attempt", "")))):
+        raise Held("run-binding", f"a completed successful protected {context} run", "incompatible run metadata")
+    linked = (run.get("pull_requests") or []) if event == "pull_request_target" else []
+    if linked and not any(item.get("number") == binding["number"]
+                          and (item.get("head") or {}).get("sha") == binding["head"]
+                          and (item.get("base") or {}).get("sha") == binding["base"]
+                          and (item.get("base") or {}).get("ref") == "main" for item in linked):
+        raise Held("run-binding", f"{context} bound to #{binding['number']} and main {binding['base'][:12]}",
+                   "another associated pair")
+    return [run_id, str(run["run_attempt"])]
+
+
+def runs_for(api, binding, inline, *, target_main=None):
+    """Exact producing runs, read by the protected landing_read.start_runs (or split-base for disjoint ancestor)."""
     options = inline_options(inline)
-    try:
-        runs = lr.start_runs(api, binding, **options)
-    except lr.Waiting as exc:
-        raise Held("run-binding", "protected runs bound to this head and main", str(exc)) from None
-    return {"match": list(runs[BOAT]), "rules": list(runs[RULES]), "inline": "success" if not options else "pending"}
+    inline_mode = "success" if not options else "pending"
+    if target_main is None or target_main == binding["base"]:
+        try:
+            runs = lr.start_runs(api, binding, **options)
+        except lr.Waiting as exc:
+            raise Held("run-binding", "protected runs bound to this head and main", str(exc)) from None
+        return {"match": list(runs[BOAT]), "rules": list(runs[RULES]), "inline": inline_mode}
+    _, bot_statuses = read_statuses_all(api, binding["head"])
+    match_run = _verify_single_run(api, BOAT, bot_statuses.get(BOAT), binding)
+    if inline_mode == "success":
+        inline_st = bot_statuses.get(INLINE) or {}
+        inline_target = lr.URL.fullmatch(inline_st.get("target_url") or "")
+        if (inline_st.get("state") != "success" or not inline_target
+                or inline_target[1] != match_run[0]
+                or marker(binding["base"]) not in (inline_st.get("description") or "")):
+            raise Held("run-binding", "inline virtual from the same Boat run", "mismatched inline run")
+    rules_binding = {"number": binding["number"], "base": target_main, "head": binding["head"]}
+    rules_run = _verify_single_run(api, RULES, bot_statuses.get(RULES), rules_binding)
+    return {"match": match_run, "rules": rules_run, "inline": inline_mode}
 
 
 def output(name, value):
@@ -479,12 +860,14 @@ def table(decisions, main, live):
     return lines
 
 
-def wait_for_measurement(api, config, binding, clock, sleep, check_first=False, max_wait=MEASURE_WAIT_SECONDS):
-    """Poll until fresh results on this main exist AND their producing runs have completed and bind.
+def wait_for_measurement(api, config, binding, clock, sleep, check_first=False, max_wait=MEASURE_WAIT_SECONDS,
+                         *, target_main=None):
+    """Poll until verified results exist AND their producing runs have completed and bind.
 
     A check posts its status a few seconds before its workflow run is marked completed, so a fresh status alone
     is not enough: the protected run check in landing_read requires a completed run.
     """
+    expected_main = target_main or binding["base"]
     deadline = clock() + (max_wait if api.live else 0)
     first = True
     while True:
@@ -492,14 +875,14 @@ def wait_for_measurement(api, config, binding, clock, sleep, check_first=False, 
             sleep(POLL_SECONDS)
         first = False
         main = current_main(api)
-        if main != binding["base"]:
-            raise Held("main-moved", f"main {binding['base'][:12]} while measuring", f"main {main[:12]}")
+        if main != expected_main:
+            raise Held("main-moved", f"main {expected_main[:12]} while measuring", f"main {main[:12]}")
         decision = evaluate(api, binding["number"], main, config)
         if decision["head"] != binding["head"]:
             raise Held("head-changed", f"head {binding['head'][:12]}", f"head {decision['head'][:12]}")
-        if decision["stage"] == "land":
+        if decision["stage"] == "land" and decision["measured_base"] == binding["base"]:
             try:
-                return decision, runs_for(api, binding, decision["inline"])
+                return decision, runs_for(api, binding, decision["inline"], target_main=expected_main)
             except Held as exc:
                 if exc.code != "run-binding":
                     raise
@@ -539,6 +922,43 @@ def measuring_state(decision, main, wall_clock=None):
     if now.tzinfo is None:
         now = now.replace(tzinfo=datetime.timezone.utc)
     return "expired" if (now - started).total_seconds() >= MEASURE_WAIT_SECONDS else "active"
+
+
+def _status_age_seconds(status_obj, wall_clock=None):
+    created = (status_obj or {}).get("created_at") or ""
+    if not created:
+        return 0.0
+    try:
+        started = datetime.datetime.strptime(created, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return 0.0
+    now = wall_clock() if wall_clock else datetime.datetime.now(datetime.timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=datetime.timezone.utc)
+    return max(0.0, (now - started).total_seconds())
+
+
+def active_header_measuring(decisions, main, wall_clock=None):
+    """Return eligible header PRs currently measuring on main (bounded to HEADER_PRIORITY_WAIT_SECONDS)."""
+    active = []
+    for item in decisions:
+        if not item.get("header_change"):
+            continue
+        reasons = item.get("reasons") or []
+        if any(r.final or r.code not in {"measuring", "header-rules"} for r in reasons):
+            continue
+        if any(r.code == "header-rules" and r.found != "no result yet" for r in reasons):
+            continue
+        boat_st = item.get("boat_status") or {}
+        boat_pending = (boat_st.get("state") == "pending"
+                        and (boat_st.get("creator") or {}).get("id") == lr.BOT_ID
+                        and marker(main) in (boat_st.get("description") or "")
+                        and _status_age_seconds(boat_st, wall_clock) < HEADER_PRIORITY_WAIT_SECONDS)
+        landing_active = (measuring_state(item, main, wall_clock) == "active"
+                          and _status_age_seconds(item.get("landing_status"), wall_clock) < HEADER_PRIORITY_WAIT_SECONDS)
+        if boat_pending or landing_active:
+            active.append(item)
+    return active
 
 
 ENQUEUE = ("mutation($pr: ID!, $head: GitObjectID!) { enqueuePullRequest(input: "
@@ -643,19 +1063,74 @@ def select(api, env, config, directory, clock=time.monotonic, sleep=time.sleep):
     only = env.get("BFME_LANDING_PR", "").strip()
     if only and not lr.NUMBER.fullmatch(only):
         raise Failed("input", "a pull request number or nothing", printable(only, 40))
-    numbers = [int(only)] if only else open_pulls(api)
-    if len(numbers) > 1 and getattr(api, "thread_safe_reads", False):
-        with ThreadPoolExecutor(max_workers=min(6, len(numbers))) as pool:
-            decisions = list(pool.map(lambda n: evaluate(api, n, main, config), numbers))
+    compare_cache, cache_lock = {}, threading.Lock()
+    prefetched_list = None if only else fetch_open_pulls_batch(api)
+    if prefetched_list is not None:
+        if len(prefetched_list) > 1 and getattr(api, "thread_safe_reads", False):
+            with ThreadPoolExecutor(max_workers=min(6, len(prefetched_list))) as pool:
+                decisions = list(pool.map(
+                    lambda item: evaluate(api, item["number"], main, config,
+                                          prefetched=item, compare_cache=compare_cache, cache_lock=cache_lock),
+                    prefetched_list,
+                ))
+        else:
+            decisions = [
+                evaluate(api, item["number"], main, config,
+                         prefetched=item, compare_cache=compare_cache, cache_lock=cache_lock)
+                for item in prefetched_list
+            ]
     else:
-        decisions = [evaluate(api, number, main, config) for number in numbers]
+        numbers = [int(only)] if only else open_pulls(api)
+        if len(numbers) > 1 and getattr(api, "thread_safe_reads", False):
+            with ThreadPoolExecutor(max_workers=min(6, len(numbers))) as pool:
+                decisions = list(pool.map(
+                    lambda n: evaluate(api, n, main, config, compare_cache=compare_cache, cache_lock=cache_lock),
+                    numbers,
+                ))
+        else:
+            decisions = [
+                evaluate(api, number, main, config, compare_cache=compare_cache, cache_lock=cache_lock)
+                for number in numbers
+            ]
     for item in decisions:
         report_hold(api, item, main=main)
         label_ledger_request(api, item)
     lines = table(decisions, main, api.live)
     if merge_queue_active(api):
         return enqueue(api, decisions, main, lines)
-    pick = next((item for item in decisions if item["stage"] == "land"), None)
+    ready_land = sorted(
+        (item for item in decisions if item["stage"] == "land"),
+        key=lambda d: (0 if d.get("header_change") else 1, 0 if not d.get("ancestor_landing") else 1, d["number"]),
+    )
+    pick = ready_land[0] if ready_land else None
+    if pick is not None and not pick.get("header_change") and not only:
+        header_active = active_header_measuring(decisions, main)
+        if header_active:
+            names = ", ".join(f"#{item['number']}" for item in header_active)
+            headline(f"Pausing narrow landings on main {main[:12]} while header PR(s) {names} finish measuring.")
+            summary(lines + ["", f"Header priority: holding narrow landing #{pick['number']} while {names} measure on main {main[:12]}."])
+            output("action", "none")
+            return 0
+        # Prevent a continuous stream of narrow PRs from starving a stale header PR waiting to re-measure,
+        # but only yield the ready narrow PR when a stale header can actually be dispatched under the cap.
+        stale_headers = [
+            item for item in decisions
+            if item.get("header_change") and item["stage"] == "remeasure" and not timed_out(item, main)
+            and measuring_state(item, main) is None
+            and (config.get("auto_admission") or item.get("trusted"))
+        ]
+        current_active = sum(
+            1 for item in decisions
+            if measuring_state(item, main) == "active"
+            or (
+                item["reasons"] and any(r.code == "measuring" for r in item["reasons"])
+                and (item.get("boat_status") or {}).get("state") == "pending"
+                and marker(main) in ((item.get("boat_status") or {}).get("description") or "")
+                and measuring_state(item, main) != "expired"
+            )
+        )
+        if stale_headers and config["remeasure"] != "off" and current_active < MAX_PARALLEL_REMEASURES:
+            pick = None
     if pick is None:
         stale_items = [item for item in decisions if item["stage"] == "remeasure" and not timed_out(item, main)]
         if not stale_items:
@@ -696,12 +1171,22 @@ def select(api, env, config, directory, clock=time.monotonic, sleep=time.sleep):
             1 for item in decisions
             if item["reasons"] and any(r.code == "measuring" for r in item["reasons"])
             and measuring_state(item, main) != "expired"
+            and (
+                measuring_state(item, main) == "active"
+                or (
+                    (item.get("boat_status") or {}).get("state") == "pending"
+                    and marker(main) in ((item.get("boat_status") or {}).get("description") or "")
+                )
+            )
         )
+        pending_dispatch.sort(key=lambda d: (0 if d.get("header_change") else 1, d["number"]))
         for item in pending_dispatch:
             if len(active) + in_flight_measuring + len(dispatched) >= MAX_PARALLEL_REMEASURES:
                 break
             item_binding = {"number": item["number"], "base": main, "head": item["head"]}
-            if config.get("auto_admission"):
+            if item.get("source_recheck_only") and config.get("auto_admission"):
+                dispatch(api, SOURCE_RECHECK_EVENT, item_binding)
+            elif config.get("auto_admission"):
                 dispatch(api, ADMIT_REQUEST_EVENT, {"number": item["number"]})
             elif not item.get("trusted"):
                 held = Held("awaiting-readmission", f"a maintainer to admit commit {item['head'][:12]} on main "
@@ -736,10 +1221,11 @@ def select(api, env, config, directory, clock=time.monotonic, sleep=time.sleep):
         summary(lines + [""] + (notes or ["Nothing to land."]))
         output("action", "none")
         return 0
-    binding = {"number": pick["number"], "base": main, "head": pick["head"]}
+    measured_base = pick["measured_base"]
+    binding = {"number": pick["number"], "base": measured_base, "head": pick["head"]}
     try:
         pick, runs = wait_for_measurement(api, config, binding, clock, sleep,
-                                          check_first=True, max_wait=LAND_SETTLE_SECONDS)
+                                          check_first=True, max_wait=LAND_SETTLE_SECONDS, target_main=main)
     except Held as exc:
         report_hold(api, {"head": binding["head"], "reasons": [exc], "landing_status": None})
         headline(f"Held #{binding['number']}: {exc.code}. Expected {exc.expected}.")
@@ -747,14 +1233,22 @@ def select(api, env, config, directory, clock=time.monotonic, sleep=time.sleep):
         output("action", "none")
         return 0
     Path(directory).mkdir(mode=0o700, parents=True)
-    Path(directory, "binding.json").write_text(json.dumps(binding | {"runs": runs}, sort_keys=True) + "\n")
+    record = binding | {"runs": runs}
+    if measured_base != main:
+        record["target_main"] = main
+    Path(directory, "binding.json").write_text(json.dumps(record, sort_keys=True) + "\n")
     for key, value in (("action", "land"), ("number", binding["number"]), ("match_run", runs["match"][0]),
                        ("match_attempt", runs["match"][1]), ("rules_run", runs["rules"][0]),
                        ("rules_attempt", runs["rules"][1]), ("inline", runs["inline"])):
         output(key, value)
-    headline(f"#{binding['number']} is measured on current main {main[:12]}; checking its receipts and merging next.")
-    summary(lines + ["", f"Candidate #{binding['number']} head {binding['head'][:12]} on main {main[:12]}; "
-                     "collecting its receipts."])
+    if measured_base != main:
+        headline(f"#{binding['number']} passed on disjoint ancestor {measured_base[:12]} for main {main[:12]}; checking receipts and merging next.")
+        summary(lines + ["", f"Candidate #{binding['number']} head {binding['head'][:12]} measured on disjoint ancestor "
+                         f"{measured_base[:12]}, landing onto main {main[:12]}; collecting its receipts."])
+    else:
+        headline(f"#{binding['number']} is measured on current main {main[:12]}; checking its receipts and merging next.")
+        summary(lines + ["", f"Candidate #{binding['number']} head {binding['head'][:12]} on main {main[:12]}; "
+                         "collecting its receipts."])
     return 0
 
 
@@ -781,16 +1275,18 @@ def land(api, env, config, directory, sleep=time.sleep):
 
 def land_bound(api, env, config, directory, prior, sleep):
     binding = {key: prior[key] for key in ("number", "base", "head")}
-    if env.get("GITHUB_SHA") != binding["base"]:
-        raise Failed("binding", f"a candidate measured on this run's main {env.get('GITHUB_SHA', '')[:12]}",
-                     f"main {binding['base'][:12]}")
-    decision = evaluate(api, binding["number"], binding["base"], config)
+    target_main = prior.get("target_main") or binding["base"]
+    is_ancestor = target_main != binding["base"]
+    if env.get("GITHUB_SHA") != target_main:
+        raise Failed("binding", f"a candidate bound to this run's main {env.get('GITHUB_SHA', '')[:12]}",
+                     f"main {target_main[:12]}")
+    decision = evaluate(api, binding["number"], target_main, config)
     if decision["head"] != binding["head"]:
         raise Held("head-changed", f"head {binding['head'][:12]}", f"head {decision['head'][:12]}")
-    if decision["stage"] != "land":
+    if decision["stage"] != "land" or decision["measured_base"] != binding["base"]:
         raise decision["reasons"][0] if decision["reasons"] else Held(
             "stale", f"results measured on main {binding['base'][:12]}", "results for another main")
-    runs = runs_for(api, binding, decision["inline"])
+    runs = runs_for(api, binding, decision["inline"], target_main=target_main)
     if runs != prior["runs"]:
         raise Held("attempt-changed", "the same producing runs as when the receipts were downloaded", "different runs")
     match = read(directory / "match/verdict.json", 256 * 1024)
@@ -799,37 +1295,96 @@ def land_bound(api, env, config, directory, prior, sleep):
     rules_policy = policy_digest(lr.TOOLS / "config.json")
     options = inline_options(runs["inline"])
     inline = read(directory / "inline/inline-status.json", 4096) if not options else None
-    try:
-        positions = lr.compare_receipts(match, inline, rules, binding, runs["match"][1], runs["match"][0],
-                                        runs["rules"][1], runs["rules"][0], rules_policy, **options)
-    except lr.Waiting as exc:
-        raise Held("receipt", "receipts for the same main, head and tree", str(exc)) from None
-    tree = positions["tree"]
+    if is_ancestor:
+        # Verify Boat match (+ optional inline) on measured ancestor, and source rules (incl. repo-wide G7) on target_main.
+        base, head, number = binding["base"], binding["head"], binding["number"]
+        if (match.get("repo") != REPO_ID or match.get("version") != 1 or match.get("number") != number
+                or match.get("base") != base or match.get("head") != head or match.get("kind") != "ok"
+                or not HEX40.fullmatch(match.get("tree", "")) or not lr.HEX64.fullmatch(match.get("plan", ""))):
+            raise Held("receipt", "a match receipt bound to the disjoint ancestor and PR head", "mismatched match receipt")
+        measured_tree = match["tree"]
+        positions = {"base": base, "head": head, "tree": measured_tree}
+        if not options and (not isinstance(inline, dict) or inline.get("binding") != positions
+                or inline.get("plan") != match["plan"] or inline.get("number") != number
+                or inline.get("repo") != REPO_ID or inline.get("run") != runs["match"][0]
+                or inline.get("attempt") != runs["match"][1] or inline.get("policy_sha256") != lr.policy()
+                or inline.get("state") != "pass" or inline.get("verdict") != "pass"
+                or not lr.HEX64.fullmatch(inline.get("evidence_sha256", ""))):
+            raise Held("receipt", "an inline receipt bound to the disjoint ancestor tree", "mismatched inline receipt")
+        if (rules.get("base") != target_main or rules.get("head") != head
+                or not HEX40.fullmatch(rules.get("tree", "")) or rules.get("number") != number
+                or rules.get("tools_commit") != target_main or rules.get("repo") != REPO_ID
+                or rules.get("run") != runs["rules"][0] or rules.get("attempt") != runs["rules"][1]
+                or rules.get("state") != "pass" or rules.get("policy_sha256") != rules_policy):
+            raise Held("receipt", "source rules passed on current main", "mismatched or stale source rules receipt")
+        tree = rules["tree"]
+        # Cryptographically prove every PR TU has the exact same blob SHA in target_tree as in measured_tree.
+        m_cache, t_cache = {}, {}
+        for fname in decision["pr_files"]:
+            m_blob = blob_sha_in_tree(api, measured_tree, fname, tree_cache=m_cache)
+            t_blob = blob_sha_in_tree(api, tree, fname, tree_cache=t_cache)
+            if not m_blob or m_blob != t_blob:
+                raise Held("receipt", f"identical blob for {fname} on ancestor and current main",
+                           f"ancestor {str(m_blob)[:12]} vs current {str(t_blob)[:12]}")
+    else:
+        try:
+            positions = lr.compare_receipts(match, inline, rules, binding, runs["match"][1], runs["match"][0],
+                                            runs["rules"][1], runs["rules"][0], rules_policy, **options)
+        except lr.Waiting as exc:
+            raise Held("receipt", "receipts for the same main, head and tree", str(exc)) from None
+        tree = positions["tree"]
+        measured_tree = tree
 
     if not api.live:
         main = current_main(api)
-        if main != binding["base"]:
-            raise Held("main-moved", f"main {binding['base'][:12]}, the commit the checks measured", f"main {main[:12]}")
+        if main != target_main:
+            raise Held("main-moved", f"main {target_main[:12]}, the commit bound for landing", f"main {main[:12]}")
         headline(f"Dry run: would merge #{binding['number']} onto main {main[:12]}.")
-        summary([f"Would merge #{binding['number']} ({MERGE_METHOD}) with expected head {binding['head'][:12]} "
-                 f"onto main {main[:12]}, expecting one parent {main[:12]} and tree {tree[:12]}."])
+        if is_ancestor:
+            summary([f"Would merge #{binding['number']} ({MERGE_METHOD}) with expected head {binding['head'][:12]} "
+                     f"onto main {main[:12]} (Boat on disjoint ancestor {binding['base'][:12]}, "
+                     f"source rules on {main[:12]}), expecting parent {main[:12]} and tree {tree[:12]}."])
+        else:
+            summary([f"Would merge #{binding['number']} ({MERGE_METHOD}) with expected head {binding['head'][:12]} "
+                     f"onto main {main[:12]}, expecting one parent {main[:12]} and tree {tree[:12]}."])
         return 0
     # The ruleset requires this status from GitHub Actions, so only this job can make the head mergeable.
-    status(api, binding["head"], "success", f"{CLEARED} {binding['base'][:12]}")
-    # Immediately before the merge: main must still be the measured commit.
+    status(api, binding["head"], "success", f"{CLEARED} {target_main[:12]}")
+    # Immediately before the merge: main must still be the bound target commit.
     main = current_main(api)
-    if main != binding["base"]:
-        raise Held("main-moved", f"main {binding['base'][:12]}, the commit the checks measured", f"main {main[:12]}")
+    if main != target_main:
+        raise Held("main-moved", f"main {target_main[:12]}, the commit bound for landing", f"main {main[:12]}")
+    extra_line = (f"Boat measured on disjoint ancestor {binding['base']}, measured tree {measured_tree}.\n"
+                  if is_ancestor else "")
+    commit_message = (f"Measured on main {target_main}, head {binding['head']}, tree {tree}.\n"
+                      f"{extra_line}"
+                      f"Pull request #{binding['number']}.\n"
+                      f"{TRAILER}, run {env.get('GITHUB_RUN_ID', '0') or '0'}.")
     body = {"merge_method": MERGE_METHOD, "sha": binding["head"],
             "commit_title": printable(f"{decision['title']} (#{binding['number']})", 250),
-            "commit_message": (f"Measured on main {binding['base']}, head {binding['head']}, tree {tree}.\n"
-                               f"Pull request #{binding['number']}.\n"
-                               f"{TRAILER}, run {env.get('GITHUB_RUN_ID', '0') or '0'}.")}
+            "commit_message": commit_message}
     code, payload = api.write("PUT", f"pulls/{binding['number']}/merge", body)
-    message = printable((payload or {}).get("message", ""), 160)
+    errors = (payload or {}).get("errors")
+    detail = f"{(payload or {}).get('message', '')} ({errors})" if errors else (payload or {}).get("message", "")
+    message = printable(detail, 240)
     if code == 409:
         raise Held("head-changed", f"head {binding['head'][:12]} at merge",
                    f"a newer head; GitHub refused the merge ({message}). The new head is measured from scratch")
+    if code == 403:
+        hdrs = getattr(api, "last_headers", None) or {}
+        diag = ", ".join(f"{k}={printable(v, 100)}" for k, v in sorted(hdrs.items()) if v)
+        if diag:
+            print(f"merge 403 diagnostics for #{binding['number']}: {diag}", file=sys.stderr)
+        comment(api, binding["number"], f"Held: GitHub refused the automated merge (HTTP 403: {message}). "
+                "This can happen when a fork branch lags a `.github/workflows/` update on `main`; "
+                "update or rebase your branch onto current `main` and push.")
+        if env.get("BFME_LANDING_CHAIN") == "1":
+            try:
+                dispatch(api, NEXT_EVENT, {"after": target_main})
+            except Held as exc:
+                print(exc.line(), file=sys.stderr)
+        raise Held("merge-forbidden", "GitHub to allow the landing workflow to merge this pull request",
+                   f"HTTP 403: {message}; update or rebase onto main and push", True)
     if code == 405:
         comment(api, binding["number"], f"Held: GitHub would not merge this pull request ({message}). "
                 "If it conflicts with main, merge or rebase main into your branch and push.")
@@ -837,23 +1392,36 @@ def land_bound(api, env, config, directory, prior, sleep):
     if code != 200 or not (payload or {}).get("merged") or not HEX40.fullmatch((payload or {}).get("sha", "")):
         raise Failed("merge", "HTTP 200 and a merged commit", f"HTTP {code}: {message}")
     commit = payload["sha"]
-    verify(api, binding, tree, commit, sleep)
-    status(api, commit, "success", f"Verified landing of #{binding['number']}: parent {binding['base'][:12]}, tree {tree[:12]}")
-    status(api, binding["head"], "success", f"Landed as {commit[:12]}")
-    comment(api, binding["number"], f"Landed as {commit} on main. Measured on main {binding['base'][:12]}, "
-            f"candidate tree {tree[:12]}; the new main commit has exactly that parent and tree.")
+    target_binding = {"number": binding["number"], "base": target_main, "head": binding["head"]}
+    verify(api, target_binding, tree, commit, sleep)
+    # Dispatch bfme-landed BEFORE posting BFME II / Landing success on commit so crash recovery (reconcile)
+    # guarantees the protected-state workflow receives the handoff even if this job stops mid-finalization.
     notified = []
-    events = [(LANDED_EVENT, landed_payload(binding["number"], binding["head"], binding["base"], commit, tree))]
+    try:
+        dispatch(api, LANDED_EVENT, landed_payload(binding["number"], binding["head"], target_main, commit, tree))
+        notified.append(LANDED_EVENT)
+    except Held as exc:
+        print(exc.line(), file=sys.stderr)
+        status(api, binding["head"], "success", f"Landed as {commit[:12]}")
+        raise
+    status(api, commit, "success",
+           f"Verified landing of #{binding['number']}: parent {target_main[:12]}, tree {tree[:12]}")
+    status(api, binding["head"], "success", f"Landed as {commit[:12]}")
+    if is_ancestor:
+        comment(api, binding["number"], f"Landed as {commit} on main (parent {target_main[:12]}, tree {tree[:12]}). "
+                f"Boat measured on disjoint ancestor {binding['base'][:12]}, source rules passed on {target_main[:12]}; "
+                f"the new main commit has exactly that parent and tree.")
+    else:
+        comment(api, binding["number"], f"Landed as {commit} on main. Measured on main {target_main[:12]}, "
+                f"candidate tree {tree[:12]}; the new main commit has exactly that parent and tree.")
     if env.get("BFME_LANDING_CHAIN") == "1":
-        events.append((NEXT_EVENT, {"after": commit}))
-    for event, payload in events:
         try:
-            dispatch(api, event, payload)
-            notified.append(event)
+            dispatch(api, NEXT_EVENT, {"after": commit})
+            notified.append(NEXT_EVENT)
         except Held as exc:
             print(exc.line(), file=sys.stderr)
-    headline(f"Landed #{binding['number']} as {commit[:12]} on main (parent {binding['base'][:12]}, tree verified).")
-    summary([f"Landed #{binding['number']} as {commit[:12]} (parent {binding['base'][:12]}, tree {tree[:12]}). "
+    headline(f"Landed #{binding['number']} as {commit[:12]} on main (parent {target_main[:12]}, tree verified).")
+    summary([f"Landed #{binding['number']} as {commit[:12]} (parent {target_main[:12]}, tree {tree[:12]}). "
              f"Sent: {', '.join(notified) or 'nothing'}."])
     return 0
 
@@ -879,10 +1447,10 @@ def reconcile(api, main):
     if not measured or not number:
         raise Failed("unreconciled-landing", f"main {main[:12]} to name its measured main, head, tree and pull request",
                      "a landing commit without them; a maintainer must check main")
-    parent, head, tree = measured.groups()
     if not api.live:
         raise Held("unreconciled-landing", f"a {LANDING_CONTEXT} status on main {main[:12]}",
                    "a landing commit not yet verified; the next live run verifies it first")
+    parent, head, tree = measured.groups()
     parents = [item.get("sha") for item in record.get("parents") or ()]
     found_tree = (record.get("tree") or {}).get("sha")
     binding = {"number": int(number[1]), "head": head, "base": parent}
@@ -891,8 +1459,8 @@ def reconcile(api, main):
                    "parents " + (", ".join(p[:12] for p in parents) or "none"))
     if found_tree != tree:
         fail_after(api, binding, main, f"tree {tree[:12]}", f"tree {str(found_tree)[:12]}")
-    status(api, main, "success", f"Verified landing of #{binding['number']}: parent {parent[:12]}, tree {tree[:12]}")
     dispatch(api, LANDED_EVENT, landed_payload(binding["number"], head, parent, main, tree))
+    status(api, main, "success", f"Verified landing of #{binding['number']}: parent {parent[:12]}, tree {tree[:12]}")
     print(f"Reconciled the earlier landing of #{binding['number']} as {main[:12]}.")
 
 

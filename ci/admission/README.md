@@ -36,8 +36,9 @@ same merged tree and policy.
 
 A reservation is used once. When the compiler check that used it finished without measuring anything (the machine
 failed, so there is no verdict), the hourly run frees that reservation for another check. It does this at most
-twice for one commit on one main, counts each retry against the daily limits, and after the third unmeasured run
-writes `Held: the compiler check failed to run three times; a maintainer will look`. A commit that has any
+four times for one commit on one main without double-charging the daily limits (pausing automatically during a
+runner outage), and after the fifth unmeasured run writes
+`Held: the compiler check failed to run five times; a maintainer will look`. A commit that has any
 verdict for that main is never measured again.
 
 ## When main moves

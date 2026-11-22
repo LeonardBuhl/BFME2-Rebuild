@@ -7,7 +7,7 @@ on:
   repository_dispatch:
     # bfme-source-refresh: admission asks for the source rules of a fork commit on a main that moved since its
     # last event (ci/admission/admit.py); source rules only, then admission decides again.
-    types: [bfme-remeasure, bfme-source-refresh]
+    types: [bfme-remeasure, bfme-source-refresh, bfme-source-recheck]
   merge_group:
     types: [checks_requested]
     branches: [main]
@@ -33,7 +33,7 @@ jobs:
       github.repository_id == '1464323350' &&
       (vars.BFME_PR_COMPACT != 'yes' || github.event_name == 'merge_group' ||
        (vars.BFME_AUTO_ADMISSION == 'yes' && github.event_name == 'repository_dispatch' &&
-           github.event.action == 'bfme-source-refresh' && github.actor_id == '41898282') ||
+           (github.event.action == 'bfme-source-refresh' || github.event.action == 'bfme-source-recheck') && github.actor_id == '41898282') ||
        (vars.BFME_AUTO_ADMISSION == 'yes' && github.event_name == 'pull_request_target' &&
            github.event.action != 'labeled' &&
            github.event.pull_request.head.repo.id != 1464323350 &&
@@ -243,4 +243,32 @@ jobs:
             exit 1
           fi
           jq -n --argjson number "$NUMBER" '{event_type: "bfme-admit-request", client_payload: {number: $number}}' |
+            gh api --method POST "repos/$GITHUB_REPOSITORY/dispatches" --input - >/dev/null
+
+  # After a landing-triggered hosted source recheck (bfme-source-recheck), wake landing immediately instead of
+  # waiting for the hourly sweep (GitHub Actions does not cascade workflow_run from GITHUB_TOKEN dispatches).
+  notify-landing:
+    needs: [source-rules, publish-source-rules]
+    if: >-
+      needs.source-rules.result == 'success' && needs.publish-source-rules.result == 'success' &&
+      github.repository_id == '1464323350' && github.ref == 'refs/heads/main' &&
+      vars.BFME_AUTO_ADMISSION == 'yes' && github.event_name == 'repository_dispatch' &&
+      github.event.action == 'bfme-source-recheck' && github.actor_id == '41898282'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    timeout-minutes: 3
+    steps:
+      - name: Ask the landing workflow to look now
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AFTER: ${{ github.event.client_payload.base }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$AFTER" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Expected a 40-character base commit. Found something else." >&2
+            exit 1
+          fi
+          jq -n --arg after "$AFTER" '{event_type: "bfme-land-next", client_payload: {after: $after}}' |
             gh api --method POST "repos/$GITHUB_REPOSITORY/dispatches" --input - >/dev/null

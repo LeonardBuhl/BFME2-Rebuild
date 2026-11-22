@@ -294,6 +294,31 @@ def unexpected_symbol_pairs(outcome, *, judge=None, obj=None, baseline=None):
     return [[h, s] for h, s in sorted(symbols.items())[:32]]
 
 
+def emitted_row_pairs(outcome, *, baseline=None):
+    """Return bounded [digest, rva, status, name] tuples for non-MATCH expected rows."""
+    if "emitted_rows" in outcome and isinstance(outcome["emitted_rows"], list):
+        if all(isinstance(p, list) and len(p) == 4 for p in outcome["emitted_rows"]):
+            return outcome["emitted_rows"][:32]
+    base_hashes = ({fact[1] for fact in native_blockers(baseline) if fact[0] == "emitted-row"}
+                   if baseline is not None else set())
+    pairs = []
+    for row in outcome.get("expected") or ():
+        if not isinstance(row, dict):
+            continue
+        status, rva = row.get("status"), row.get("rva")
+        if not status or status == "MATCH" or not rva:
+            continue
+        try:
+            fact_hash = digest(encoded([int(rva, 16), status]))
+        except (TypeError, ValueError):
+            continue
+        if fact_hash in base_hashes:
+            continue
+        name = row.get("symbol") or row.get("name") or ""
+        pairs.append([fact_hash, str(rva), str(status), str(name)[:120]])
+    return sorted(pairs)[:32]
+
+
 def attach_blockers(judge, side_dir, table, *, baseline=None, include_symbols=True):
     """Precompute structural blockers and safe symbol labels using compiled COFF objects."""
     for path, outcome in table.items():
@@ -307,6 +332,9 @@ def attach_blockers(judge, side_dir, table, *, baseline=None, include_symbols=Tr
             pairs = unexpected_symbol_pairs(outcome, judge=judge, obj=target, baseline=base_outcome)
             if pairs:
                 outcome["unexpected_symbols"] = pairs
+            epairs = emitted_row_pairs(outcome, baseline=base_outcome)
+            if epairs:
+                outcome["emitted_rows"] = epairs
 
 
 def index(table):
@@ -315,6 +343,7 @@ def index(table):
                    "gates": set(item["gates"]),
                    "blockers": {tuple(fact) for fact in native_blockers(item)},
                    "unexpected_symbols": {pair[0]: pair[1] for pair in unexpected_symbol_pairs(item)},
+                   "emitted_rows": {pair[0]: (pair[1], pair[2], pair[3]) for pair in emitted_row_pairs(item)},
                    "proven": {row["rva"] for row in item["rows"]
                               if row.get("credited", row["status"] == "MATCH") and row.get("proof") == "proven"},
                    "rows": {row["rva"]: (row["status"], row.get("pct", 100.0 if row["status"] == "MATCH" else 0.0))
@@ -340,9 +369,33 @@ def reduction(old, new):
         new_blockers = sorted(current["blockers"] - prior["blockers"])
         rules.update(kind for kind, _ in new_blockers)
         sym_map = current.get("unexpected_symbols") or {}
+        emitted_by_hash = {
+            digest(encoded([int(address, 16), status])): (address, status, pct)
+            for address, (status, pct) in current["rows"].items()
+            if status != "MATCH"
+        }
         for kind, fact_hash in new_blockers:
             if kind == "unexpected-code" and fact_hash in sym_map:
                 hint.append(f"{path}: unexpected emitted code symbol `{sym_map[fact_hash]}`.")
+            elif kind == "emitted-row":
+                row_info = emitted_by_hash.get(fact_hash)
+                exp_info = (current.get("emitted_rows") or {}).get(fact_hash)
+                if row_info is not None:
+                    address, status, pct = row_info
+                    previous = prior["rows"].get(address, ("MISSING", 0.0))[0]
+                    hint.append(f"{path} at {address}: emitted function {status} ({pct:.1f}% vs retail; previously {previous}).")
+                elif exp_info is not None:
+                    address, status, name = exp_info
+                    label = f" `{name}`" if name else ""
+                    hint.append(f"{path} at {address}{label}: emitted function {status} (expected row mismatch vs retail).")
+                else:
+                    hint.append(f"{path}: an emitted function did not match retail.")
+            elif kind == "owned-order":
+                hint.append(f"{path}: compiled owned function order differs from retail RVA order.")
+            elif kind == "placeholder-virtual":
+                hint.append(f"{path}: placeholder virtual or unresolved draft type in compiled object.")
+            elif kind == "native-object":
+                hint.append(f"{path}: object verification blocker (missing/ambiguous COFF position or stale receipt).")
         for address, (status, _) in current["rows"].items():
             previous = prior["rows"].get(address, ("MISSING", 0.0))[0]
             if previous == status:

@@ -42,7 +42,7 @@ checks the affected source files.
 - **Draft pull requests** run source rules, while automatic Boat admission waits until the pull request is marked
   **Ready for review**.
 - **Ready header (`include/`) pull requests** (up to 60 files under `src/` and `include/`, passing current
-  source rules) are admitted automatically under the wide daily budget (currently 5/author and 20 total/day).
+  source rules) are admitted automatically under the wide daily budget (currently 10/author and 40 total/day; narrow source-only budget is 60/author and 300 total/day).
 - **Other maintainer-scoped pull requests** wait for a maintainer to admit each commit with the `boat-ok` label
   (`Held: awaiting-admission` / `Held: awaiting-readmission`).
 
@@ -54,7 +54,7 @@ automatically.
 A pull request lands by itself, as one squash commit credited to you, when the source rules and the Boat check
 passed on its latest commit against the current `main`, Inline virtual is not failing (a fresh failure blocks
 landing and a stale failure triggers remeasurement; pending can land), it is ready for review (not a draft), it
-merges cleanly and it changes nothing under `.github/`. Both checks must be current on `main` before landing. Changes under
+merges cleanly and it changes nothing under `.github/`. Source rules (including repository-wide G7 one-definition checks) must be current on `main` before landing; for `src/Code/*.c(pp)`-only pull requests, a Boat pass on a recent disjoint `src/Code/`-only ancestor carries forward after a fast hosted source-rules recheck. Header pull requests are prioritized ahead of narrow landings while measuring. Changes under
 `include/` land automatically once **BFME II / Header rules** pass on current `main`, or once a listed
 maintainer in `ci/landing/landing.json` approves that exact commit when header rules are held (not failed). A draft can receive
 feedback before you choose **Ready for review**.

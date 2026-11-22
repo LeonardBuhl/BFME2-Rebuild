@@ -124,9 +124,9 @@ def env(live=True, event="pull_request_target", path="", sha=MAIN, total="3", pe
             "GITHUB_SHA": sha, "BFME_ADMISSION_DAILY_TOTAL": total, "BFME_ADMISSION_DAILY_PER_AUTHOR": per_author}
 
 
-def handle(api, number=21, base=MAIN, budget=BUDGET):
+def handle(api, number=21, base=MAIN, budget=BUDGET, **kwargs):
     with redirect_stdout(io.StringIO()):
-        return handle_with_proof(api, number, CONFIG, base, budget, CLOCK, sleep=lambda seconds: None)
+        return handle_with_proof(api, number, CONFIG, base, budget, CLOCK, sleep=lambda seconds: None, **kwargs)
 
 
 def latest(api, head=HEAD):
@@ -213,14 +213,57 @@ class Handle(unittest.TestCase):
     def test_same_commit_is_counted_once_and_measured_once(self):
         api = LedgerApi(True, [fork_pr()], {21: ["src/a.cpp"]})
         handle(api)
-        # Not claimed yet: a repeat re-dispatches (the compiler check's single-use claim fences it), counting nothing.
-        self.assertIn("admitted by rule", handle(api))
+        # Rapid duplicate event before claim does NOT double-dispatch.
+        self.assertIn("already dispatched", handle(api))
+        self.assertEqual(len(dispatches(api)), 1)
+        self.assertEqual(json.loads(api.store["ledger.json"][0])["days"][DAY]["total"], 1)
+        # Hourly refresh re-dispatches a stranded unclaimed reservation (still counting nothing).
+        self.assertIn("admitted by rule", handle(api, refresh=True))
         self.assertEqual(len(dispatches(api)), 2)
         self.assertEqual(json.loads(api.store["ledger.json"][0])["days"][DAY]["total"], 1)
         # Claimed: measured, nothing more is dispatched.
         self.assertEqual(admit.ledger.claim(api, 21, HEAD, MAIN, "900", "1", CLOCK, tree=TREE), "claimed")
         self.assertIn("reservation was already used", handle(api))
         self.assertEqual(len(dispatches(api)), 2)
+
+    def test_outage_does_not_overwrite_already_measured_pr_status(self):
+        api = LedgerApi(True, [fork_pr()], {21: ["src/a.cpp"]})
+        handle(api)
+        self.assertEqual(admit.ledger.claim(api, 21, HEAD, MAIN, "900", "1", CLOCK, tree=TREE), "claimed")
+        now_s = CLOCK().strftime("%Y-%m-%dT%H:%M:%SZ")
+        orig_call = api.call
+        def outage_call(path):
+            if path.startswith("actions/workflows/managed-pr.yml/runs"):
+                return {"workflow_runs": [
+                    {"id": 100 + i, "event": "repository_dispatch", "status": "completed", "conclusion": "failure", "updated_at": now_s}
+                    for i in range(4)
+                ]}
+            if path.startswith("actions/runs/") and "/jobs" in path:
+                return {"jobs": [{"name": "Isolated Boat compilershard 1", "conclusion": "failure"}]}
+            return orig_call(path)
+        api.call = outage_call
+        line = handle(api)
+        self.assertIn("reservation was already used", line)
+        self.assertEqual(latest(api)["state"], "success")
+        self.assertEqual(latest(api)["description"], admit.admitted_text(MAIN))
+
+    def test_outage_breaker_counts_timed_out_boat_runs(self):
+        api = LedgerApi(True, [fork_pr()], {21: ["src/a.cpp"]})
+        now_s = CLOCK().strftime("%Y-%m-%dT%H:%M:%SZ")
+        orig_call = api.call
+        def timeout_call(path):
+            if path.startswith("actions/workflows/managed-pr.yml/runs"):
+                return {"workflow_runs": [
+                    {"id": 200 + i, "event": "repository_dispatch", "status": "completed", "conclusion": "timed_out", "updated_at": now_s}
+                    for i in range(4)
+                ]}
+            if path.startswith("actions/runs/") and "/jobs" in path:
+                return {"jobs": [{"name": "Isolated Boat compilershard 1", "conclusion": "timed_out"}]}
+            return orig_call(path)
+        api.call = timeout_call
+        line = handle(api)
+        self.assertIn("paused, compiler runners unavailable", line)
+        self.assertEqual(dispatches(api), [])
 
     def test_each_new_push_is_judged_again(self):
         api = LedgerApi(True, [fork_pr()], {21: ["src/a.cpp"]})
@@ -579,7 +622,7 @@ class UnmeasuredRun(unittest.TestCase):
         self.assertEqual((item["claimed_by"], item["admitted_by"], item["reissues"]),
                          (None, {"run": "7", "attempt": "1"}, 1))
         counts = json.loads(api.store["ledger.json"][0])["days"][DAY]
-        self.assertEqual((counts["total"], counts["authors"]), (2, {"424242": 2}))
+        self.assertEqual((counts["total"], counts["authors"]), (1, {"424242": 1}))
         # The compiler check can claim it again, once.
         self.assertEqual(admit.ledger.claim(api, 21, HEAD, MAIN, "901", "1", CLOCK, tree=TREE), "claimed")
         self.assertEqual(admit.ledger.claim(api, 21, HEAD, MAIN, "902", "1", CLOCK, tree=TREE), "claimed-by-other")
@@ -645,27 +688,47 @@ class UnmeasuredRun(unittest.TestCase):
         api.ledger_failure = 502
         self.assertIsNone(admit.unmeasured_claim(api, 21, HEAD, MAIN, CLOCK))
 
-    def test_at_most_two_retries_then_a_plain_hold(self):
+    def test_at_most_four_retries_then_a_plain_hold(self):
         api = self.used()
-        api_budget = {"daily_total": 9, "daily_per_author": 9}
-        for number, run in enumerate(("901", "902"), start=1):
+        api_budget = {"daily_total": 1, "daily_per_author": 1}
+        for number, run in enumerate(("901", "902", "903", "904"), start=1):
             self.assertIn("admitted by rule", handle(api, budget=api_budget))
             self.assertEqual(self.item(api)["reissues"], number)
             self.assertEqual(admit.ledger.claim(api, 21, HEAD, MAIN, run, "1", CLOCK, tree=TREE), "claimed")
             api.runs[run] = compiler_run(run)
-        self.assertIn("unmeasured three times", handle(api, budget=api_budget))
-        self.assertEqual(len(dispatches(api)), 3)
+        self.assertIn("unmeasured five times", handle(api, budget=api_budget))
+        self.assertEqual(len(dispatches(api)), 5)
         self.assertEqual((latest(api)["state"], latest(api)["description"]), ("pending", admit.UNMEASURED))
         writes = len(api.writes)
-        self.assertIn("unmeasured three times", handle(api, budget=api_budget))
+        self.assertIn("unmeasured five times", handle(api, budget=api_budget))
         self.assertEqual(len(api.writes), writes)          # said once, written once
 
-    def test_a_retry_counts_against_the_daily_limits(self):
+    def test_an_infra_retry_does_not_double_charge_daily_limits(self):
         api = self.used()
-        self.assertIn("daily limit reached", handle(api, budget={"daily_total": 1, "daily_per_author": 1}))
-        self.assertEqual(len(dispatches(api)), 1)
-        self.assertEqual(latest(api)["description"], admit.DAILY_LIMIT)
-        self.assertEqual(self.item(api)["claimed_by"], {"run": "900", "attempt": "1"})
+        self.assertIn("admitted by rule", handle(api, budget={"daily_total": 1, "daily_per_author": 1}))
+        self.assertEqual(len(dispatches(api)), 2)
+        self.assertEqual(json.loads(api.store["ledger.json"][0])["days"][DAY]["total"], 1)
+
+    def test_boat_outage_circuit_breaker_pauses_admissions_without_burning_retries(self):
+        api = self.used()
+        orig_call = api.call
+        def outage_call(path):
+            if path.startswith("actions/workflows/managed-pr.yml/runs"):
+                return {"workflow_runs": [
+                    {"id": 1000 + i, "conclusion": "failure", "updated_at": "2026-11-20T19:44:00Z"}
+                    for i in range(4)
+                ]}
+            if path.startswith("actions/runs/100"):
+                return {"jobs": [
+                    {"name": "Isolated Boat compiler and native comparison", "conclusion": "failure"},
+                    {"name": "Report on the pull request head", "conclusion": "failure"},
+                ]}
+            return orig_call(path)
+        api.call = outage_call
+        msg = handle(api, budget={"daily_total": 9, "daily_per_author": 9})
+        self.assertIn("compiler runners unavailable", msg)
+        self.assertEqual((latest(api)["state"], latest(api)["description"]), ("pending", admit.OUTAGE))
+        self.assertNotIn("reissues", self.item(api))
 
     def test_only_the_inspected_claim_is_released(self):
         api = self.used()
@@ -679,7 +742,7 @@ class UnmeasuredRun(unittest.TestCase):
     def test_an_unclaimed_reservation_is_not_counted_as_a_retry(self):
         api = LedgerApi(True, [fork_pr()], {21: ["src/a.cpp"]})
         handle(api)
-        self.assertIn("admitted by rule", handle(api))      # stranded before its claim: re-dispatched, as before
+        self.assertIn("admitted by rule", handle(api, refresh=True))      # stranded before its claim: re-dispatched on refresh
         self.assertNotIn("reissues", self.item(api))
         self.assertEqual(json.loads(api.store["ledger.json"][0])["days"][DAY]["total"], 1)
 
@@ -757,6 +820,145 @@ class DormantRefusal(unittest.TestCase):
                                wide_budget={"daily_total": 20, "daily_per_author": 5},
                                refresh=True, source_proof=lambda *_: None)
         self.assertIn("admitted by rule", out)
+
+
+
+class Cut11SwarmTests(unittest.TestCase):
+    def test_reserve_does_not_double_charge_same_head_when_main_moves(self):
+        api = LedgerApi(True, [], {})
+        limits = {"daily_total": 1, "daily_per_author": 1}
+        m1, m2 = "1" * 40, "2" * 40
+        r1 = admit.ledger.reserve(api, limits, 42, 7, HEAD, m1, "100", "1", CLOCK, tree="3" * 40, kind="wide")
+        self.assertEqual(r1, "reserved")
+        # Main moves to m2 while head is unchanged: must NOT consume a second quota slot.
+        r2 = admit.ledger.reserve(api, limits, 42, 7, HEAD, m2, "101", "1", CLOCK, tree="4" * 40, kind="wide")
+        self.assertEqual(r2, "reserved")
+        data, _ = admit.ledger._read(api)
+        today = admit.ledger.days(CLOCK)[0]
+        self.assertEqual(data["days"][today]["wide_total"], 1)
+        self.assertEqual(data["days"][today]["wide_authors"]["42"], 1)
+
+    def test_retry_skips_boat_on_build_neutral_or_disjoint_ancestor_but_request_honors_landing(self):
+        old_main = "1" * 40
+        pr = fork_pr(number=44)
+        api = LedgerApi(True, [pr], {44: ["src/Code/GameEngine/A.cpp"]})
+        api.statuses[HEAD] = [
+            {"id": 10, "context": admit.CONTEXT, "state": "success",
+             "description": admit.ADMITTED, "creator": {"id": admit.BOT_ID}},
+            {"id": 11, "context": admit.BOAT_CONTEXT, "state": "success",
+             "description": f"BFME II comparison passed (main {old_main[:12]})",
+             "creator": {"id": admit.BOT_ID}},
+        ]
+        orig = api.call
+        def fake_call(path):
+            if path.startswith("compare/"):
+                return {"status": "ahead", "ahead_by": 2, "behind_by": 0,
+                        "files": [{"filename": "docs/guide.md", "status": "modified"},
+                                  {"filename": "src/Code/GameEngine/B.cpp", "status": "modified"}]}
+            return orig(path)
+        api.call = fake_call
+        with redirect_stdout(io.StringIO()):
+            out_retry = admit.handle(api, 44, CONFIG, MAIN, BUDGET, CLOCK, refresh=True,
+                                     allow_ancestor_skip=True, source_proof=lambda *_: None)
+        self.assertIn("Boat already passed on disjoint ancestor", out_retry)
+        # Explicit landing request (allow_ancestor_skip=False) MUST still admit/remeasure.
+        with redirect_stdout(io.StringIO()):
+            out_req = admit.handle(api, 44, CONFIG, MAIN, BUDGET, CLOCK, refresh=True,
+                                   allow_ancestor_skip=False, source_proof=lambda *_: None)
+        self.assertIn("admitted by rule", out_req)
+
+    def test_fetch_retry_candidates_batch_graphql_and_fallback(self):
+        class GqlApi:
+            def __init__(self, fail=False):
+                self.fail = fail
+            def query(self, q, variables):
+                if self.fail:
+                    raise admit.ApiError(502, "bad gateway")
+                return {
+                    "repository": {
+                        "pullRequests": {
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [{
+                                "number": 50, "title": "Fix", "state": "OPEN", "isDraft": False,
+                                "authorAssociation": "NONE", "baseRefName": "main", "headRefOid": HEAD,
+                                "author": {"login": "bob", "databaseId": 77},
+                                "headRepository": {"databaseId": 999}, "baseRepository": {"databaseId": 1464323350},
+                                "files": {"totalCount": 1, "nodes": [{"path": "src/Code/A.cpp", "changeType": "MODIFIED"}]},
+                                "commits": {"nodes": [{"commit": {"status": {"contexts": []}}}]},
+                            }, {
+                                "number": 51, "title": "Draft", "state": "OPEN", "isDraft": True,
+                                "authorAssociation": "NONE", "baseRefName": "main", "headRefOid": HEAD,
+                                "author": {"login": "bob", "databaseId": 77},
+                                "headRepository": {"databaseId": 999}, "baseRepository": {"databaseId": 1464323350},
+                                "files": {"totalCount": 1, "nodes": [{"path": "src/Code/B.cpp", "changeType": "MODIFIED"}]},
+                                "commits": {"nodes": [{"commit": {"status": {"contexts": []}}}]},
+                            }],
+                        }
+                    }
+                }
+        res = admit.fetch_retry_candidates_batch(GqlApi(fail=False))
+        self.assertEqual([item["number"] for item in res], [50])
+        self.assertEqual(res[0]["files"], ["src/Code/A.cpp"])
+        self.assertIsNone(admit.fetch_retry_candidates_batch(GqlApi(fail=True)))
+
+
+
+    def test_quota_waiver_does_not_slide_across_days(self):
+        api = LedgerApi(True, [], {})
+        limits = {"daily_total": 1, "daily_per_author": 1}
+        day1 = lambda: datetime.datetime(2026, 11, 20, 12, 0, tzinfo=datetime.timezone.utc)
+        day2 = lambda: datetime.datetime(2026, 11, 21, 12, 0, tzinfo=datetime.timezone.utc)
+        day3 = lambda: datetime.datetime(2026, 11, 22, 12, 0, tzinfo=datetime.timezone.utc)
+        self.assertEqual(admit.ledger.reserve(api, limits, 42, 7, HEAD, "1" * 40, "1", "1", day1, tree="a" * 40, kind="wide"), "reserved")
+        # Same day, new base: free!
+        self.assertEqual(admit.ledger.reserve(api, limits, 42, 7, HEAD, "2" * 40, "2", "1", day1, tree="b" * 40, kind="wide"), "reserved")
+        # Next day: paid_day != today, so charges 1 on day2; a second distinct head on day2 hits over-budget!
+        self.assertEqual(admit.ledger.reserve(api, limits, 42, 7, HEAD, "3" * 40, "3", "1", day2, tree="c" * 40, kind="wide"), "reserved")
+        self.assertEqual(admit.ledger.reserve(api, limits, 42, 8, "9" * 40, "3" * 40, "4", "1", day2, tree="d" * 40, kind="wide"), "over-budget")
+        # Day 3: charges 1 on day3 (never slides infinitely for free)
+        self.assertEqual(admit.ledger.reserve(api, limits, 42, 7, HEAD, "4" * 40, "5", "1", day3, tree="e" * 40, kind="wide"), "reserved")
+        data, _ = admit.ledger._read(api)
+        self.assertEqual(data["days"]["2026-11-22"]["wide_total"], 1)
+
+    def test_retry_does_not_skip_when_boat_pass_is_expired_or_beyond_32_commits(self):
+        old_main = "1" * 40
+        pr = fork_pr(number=45)
+        api = LedgerApi(True, [pr], {45: ["src/Code/GameEngine/A.cpp"]})
+        # 22 hours old -> outside 18h freshness window, must re-measure
+        api.statuses[HEAD] = [
+            {"id": 10, "context": admit.CONTEXT, "state": "success",
+             "description": admit.ADMITTED, "creator": {"id": admit.BOT_ID}},
+            {"id": 11, "context": admit.BOAT_CONTEXT, "state": "success",
+             "description": f"BFME II comparison passed (main {old_main[:12]})",
+             "created_at": "2026-11-19T14:00:00Z",
+             "creator": {"id": admit.BOT_ID}},
+        ]
+        orig = api.call
+        api.call = lambda path: ({"status": "ahead", "ahead_by": 2, "behind_by": 0,
+                                  "files": [{"filename": "docs/guide.md", "status": "modified"}]}
+                                 if path.startswith("compare/") else orig(path))
+        with redirect_stdout(io.StringIO()):
+            out_old = admit.handle(api, 45, CONFIG, MAIN, BUDGET, CLOCK, refresh=True,
+                                   allow_ancestor_skip=True, source_proof=lambda *_: None)
+        self.assertIn("admitted by rule", out_old)
+        # Fresh timestamp but ahead_by=33 (>32): must NOT skip
+        api2 = LedgerApi(True, [pr], {45: ["src/Code/GameEngine/A.cpp"]})
+        api2.statuses[HEAD] = [
+            {"id": 10, "context": admit.CONTEXT, "state": "success",
+             "description": admit.ADMITTED, "creator": {"id": admit.BOT_ID}},
+            {"id": 11, "context": admit.BOAT_CONTEXT, "state": "success",
+             "description": f"BFME II comparison passed (main {old_main[:12]})",
+             "created_at": "2026-11-20T11:00:00Z",
+             "creator": {"id": admit.BOT_ID}},
+        ]
+        orig2 = api2.call
+        api2.call = lambda path: ({"status": "ahead", "ahead_by": 33, "behind_by": 0,
+                                   "files": [{"filename": "docs/guide.md", "status": "modified"}]}
+                                  if path.startswith("compare/") else orig2(path))
+        with redirect_stdout(io.StringIO()):
+            out_far = admit.handle(api2, 45, CONFIG, MAIN, BUDGET, CLOCK, refresh=True,
+                                   allow_ancestor_skip=True, source_proof=lambda *_: None)
+        self.assertIn("admitted by rule", out_far)
 
 
 if __name__ == "__main__":

@@ -81,12 +81,12 @@ failure blocks; a stale failure triggers re-measurement.)
 
 - **Ready source-only pull requests** (1-8 eligible `src/` paths affecting at
   most 8 translation units, passing current source rules, within daily limits
-  of 30/author and 150 total): admitted automatically, compiled on Boat, and
+  of 60/author and 300 total): admitted automatically, compiled on Boat, and
   auto-landed when green—no `boat-ok` label needed.
 - **Header pull requests (`include/`):** ready fork pull requests changing
   `include/` (up to 60 files under `src/` and `include/`, passing current
   source rules) are admitted automatically under the wide daily budget
-  (currently 5/author and 20 total/day). Boat compares all affected translation
+  (currently 10/author and 40 total/day). Boat compares all affected translation
   units, including transitive includers (narrow for at most 8 affected units;
   wide for larger eligible sets). Header PRs auto-land once **BFME II / Header rules** pass on current `main`
   (including member layout changes proven by a matching typed-access witness

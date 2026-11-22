@@ -1,0 +1,48 @@
+name: BFME II CI unit tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ci/**'
+      - 'tools/gates/**'
+      - '.github/workflows/ci-tests.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'ci/**'
+      - 'tools/gates/**'
+      - '.github/workflows/ci-tests.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  unit-tests:
+    if: github.repository == 'Open-BFME/BFME2-Rebuild'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Verify bundle manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in ci/landing ci/admission ci/managed-check ci/managed-state; do
+            (cd "$dir" && sha256sum -c --quiet bundle.sha256)
+          done
+      - name: Run all CI test suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          for suite in ci/landing/tests ci/admission/tests ci/managed-check/tests ci/state/tests ci/nightly/tests ci/header/tests ci/header-witness/tests ci/progress/tests; do
+            if [ -d "$suite" ]; then
+              echo "=== $suite ==="
+              python3 -m unittest discover -s "$suite"
+            fi
+          done

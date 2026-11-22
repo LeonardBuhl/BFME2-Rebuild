@@ -15,6 +15,7 @@ jobs:
         run: |
           set -euo pipefail
           deadline=$((SECONDS + 90))
+          runner_grace=$((SECONDS + 15))
           waited=0
           while true; do
             pending=$(awk '
@@ -33,6 +34,15 @@ jobs:
               if [ "$waited" -eq 1 ]; then
                 printf 'Runner filesystem hydration finished after %ss.\n' "$SECONDS"
               fi
+              exit 0
+            fi
+            home_dir="${HOME%/}"
+            if [ -n "$home_dir" ] && [ "$pending" = "$home_dir" ] \
+              && [ "${pending#/opt/boat-compiler}" = "$pending" ] \
+              && [ "${pending#/var/}" = "$pending" ] \
+              && [ "${pending#/usr}" = "$pending" ] \
+              && [ "$SECONDS" -ge "$runner_grace" ]; then
+              printf 'Proceeding after %ss with persistent lazy mount %s (all other mounts retired).\n' "$SECONDS" "$home_dir"
               exit 0
             fi
             waited=1

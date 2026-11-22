@@ -63,13 +63,13 @@ patched and extended.
    - **Draft PRs:** **BFME II / source rules** can run, but **automatic Boat admission waits until the PR is marked
      Ready for review** (maintainer-started checks are separate).
    - **Ready `src/`-only fork PRs** (1-8 eligible `src/` paths, <= 8 affected TUs, passing source rules, within the
-     daily limits—currently 30/author and 150 total/day): automatically admitted, compiled on Boat, and
-     squash-merged to `main` once current **BFME II / source rules** and **BFME II / Boat** pass on current `main`
-     with a clean merge and no landing hold. (**BFME II / Inline virtual** pending can land; a fresh failure blocks;
+     daily limits—currently 60/author and 300 total/day): automatically admitted, compiled on Boat, and
+     squash-merged to `main` once **BFME II / source rules** pass on current `main` and **BFME II / Boat** passed
+     on current `main` (or a recent disjoint `src/Code/`-only ancestor) with a clean merge and no landing hold. (**BFME II / Inline virtual** pending can land; a fresh failure blocks;
      a stale failure triggers re-measurement.)
    - **Header PRs (`include/`):** ready fork PRs changing `include/` (with or without `src/`, up to 60 files,
-     passing current source rules) are admitted automatically under the wide daily budget (currently 5/author and
-     20 total/day). Boat compares all affected TUs including transitive includers (narrow for <= 8 affected TUs,
+     passing current source rules) are admitted automatically under the wide daily budget (currently 10/author and
+     40 total/day). Boat compares all affected TUs including transitive includers (narrow for <= 8 affected TUs,
      wide for larger eligible sets). Header PRs auto-land once **BFME II / Header rules** pass on current `main`
      (including member layout changes proven by a matching typed-access witness under H5); header PRs whose Header
      rules are held (not failed) wait for approval on that exact head from a listed maintainer in
@@ -79,7 +79,7 @@ patched and extended.
      automatically), held for a rebase/conflict (update your branch and push), or waiting on a maintainer.
    - **`BFME II / Boat`:** open **Details** for per-function verdicts (`MATCH / proven`, `PARTIAL` with first
      differing offset and compiled instructions when available, `COMPILE_ERROR`, or refusing rule). Fix code
-     refusals and push. Unmeasured infrastructure faults retry automatically (up to twice before a maintainer hold);
+     refusals and push. Unmeasured infrastructure faults retry automatically without double-charging your daily budget (up to four free retries before a maintainer hold), and pause automatically during a runner outage;
      do not force-push blindly on a transient retry.
    - **`BFME II / Landing`:** reports why a ready PR has not merged yet (`measuring`, `check-failure`,
      `merge-conflict`, `header-approval`, etc.).

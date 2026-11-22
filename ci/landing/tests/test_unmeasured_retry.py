@@ -106,15 +106,15 @@ class RequestModeRetries(unittest.TestCase):
         api = ta.LedgerApi(True, [ta.fork_pr()], {21: ["src/a.cpp"]})
         ta.handle(api)
         lines = []
-        for attempt, run in enumerate(("900", "901", "902")):
+        for attempt, run in enumerate(("900", "901", "902", "903", "904")):
             self.assertEqual(ta.admit.ledger.claim(api, 21, ta.HEAD, ta.MAIN, run, "1", ta.CLOCK, tree=ta.TREE),
                              "claimed")
             self.died(api, run)
             lines.append(self.request(api))
-        self.assertIn("admitted by rule", lines[0])
-        self.assertIn("admitted by rule", lines[1])
-        self.assertIn("three times", lines[2])
-        self.assertEqual(len([d for d in ta.dispatches(api) if d["event_type"] == "bfme-remeasure"]), 3)
+        for idx in range(4):
+            self.assertIn("admitted by rule", lines[idx])
+        self.assertIn("five times", lines[4])
+        self.assertEqual(len([d for d in ta.dispatches(api) if d["event_type"] == "bfme-remeasure"]), 5)
         self.assertEqual(api.statuses[ta.HEAD][-1]["description"], ta.admit.UNMEASURED)
 
 

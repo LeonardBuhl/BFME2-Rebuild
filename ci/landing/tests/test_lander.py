@@ -69,12 +69,20 @@ def env(main=MEASURED, mode="dry-run", pr="", run="1"):
 
 
 def put_receipts(directory, drop_inline=False):
+    from gate import policy_digest
+    live_inline_policy = lander.lr.policy()
+    live_rules_policy = policy_digest(lander.lr.TOOLS / "config.json")
     for name, record in FIXTURE["receipts"].items():
         if drop_inline and name.startswith("inline/"):
             continue
+        rec = copy.deepcopy(record)
+        if name == "inline/inline-status.json":
+            rec["policy_sha256"] = live_inline_policy
+        elif name == "rules/receipt.json":
+            rec["policy_sha256"] = live_rules_policy
         path = Path(directory, name)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(record))
+        path.write_text(json.dumps(rec))
 
 
 def receipts_match_checkout():
@@ -219,7 +227,7 @@ class Reconcile(unittest.TestCase):
         api = FakeApi(live=True, main=NEW, edit=titled)
         with tempfile.TemporaryDirectory() as tmp:
             quiet(lander.run, ["select", tmp + "/w"], env(main=NEW, mode="live", pr="3"), api=api, config=CONFIG)
-        self.assertEqual(api.writes[1][2]["client_payload"], {
+        self.assertEqual(api.writes[0][2]["client_payload"], {
             "number": 2, "head": PR2, "parent": MEASURED, "commit": NEW, "tree": TREE})
 
         def title_only(fx):
@@ -238,9 +246,9 @@ class Reconcile(unittest.TestCase):
             code, out = quiet(lander.run, ["select", tmp + "/w"], env(main=NEW, mode="live", pr="3"),
                               api=api, config=CONFIG)
         self.assertEqual(code, 0)
-        self.assertEqual(api.writes[0][:2], ("POST", f"statuses/{NEW}"))
-        self.assertEqual(api.writes[0][2]["state"], "success")
-        self.assertEqual(api.writes[1], ("POST", "dispatches", {"event_type": "bfme-landed", "client_payload": {
+        self.assertEqual(api.writes[1][:2], ("POST", f"statuses/{NEW}"))
+        self.assertEqual(api.writes[1][2]["state"], "success")
+        self.assertEqual(api.writes[0], ("POST", "dispatches", {"event_type": "bfme-landed", "client_payload": {
             "number": 2, "head": PR2, "parent": MEASURED, "commit": NEW, "tree": TREE}}))
         self.assertIn("Reconciled the earlier landing of #2", out)
 
@@ -429,8 +437,6 @@ class Remeasure(unittest.TestCase):
         self.assertIn("automatic re-measurement is off", out)
 
 
-@unittest.skipUnless(receipts_match_checkout(), "the captured receipts were produced by ci/managed-check at 879a5be4; "
-                     "run these tests in a checkout of that commit plus ci/landing")
 class Land(unittest.TestCase):
     def prepare(self, tmp, api, drop_inline=False):
         code, _ = quiet(lander.run, ["select", tmp + "/w"], env(pr="2", mode="live" if api.live else "dry-run"),
@@ -507,11 +513,11 @@ class Land(unittest.TestCase):
         self.assertEqual((method, path, body["sha"], body["merge_method"]), ("PUT", "pulls/2/merge", PR2, "squash"))
         self.assertTrue(body["commit_title"].endswith("(#2)"))
         kinds = [(w[0], w[1]) for w in api.writes[2:]]
-        self.assertEqual(kinds, [("POST", f"statuses/{NEW}"), ("POST", f"statuses/{PR2}"), ("POST", "issues/2/comments"),
-                                 ("POST", "dispatches"), ("POST", "dispatches")])
-        self.assertEqual(api.writes[5][2], {"event_type": "bfme-landed", "client_payload": {
+        self.assertEqual(kinds, [("POST", "dispatches"), ("POST", f"statuses/{NEW}"), ("POST", f"statuses/{PR2}"),
+                                 ("POST", "issues/2/comments"), ("POST", "dispatches")])
+        self.assertEqual(api.writes[2][2], {"event_type": "bfme-landed", "client_payload": {
             "number": 2, "head": PR2, "parent": MEASURED, "commit": NEW, "tree": TREE}})
-        self.assertEqual(list(api.writes[5][2]["client_payload"]), ["number", "head", "parent", "commit", "tree"])
+        self.assertEqual(list(api.writes[2][2]["client_payload"]), ["number", "head", "parent", "commit", "tree"])
         # The body this workflow writes is exactly what a later run parses to reconcile this landing.
         lines = body["commit_message"].splitlines()
         self.assertEqual(lander.MEASURED_LINE.fullmatch(lines[0]).groups(), (MEASURED, PR2, TREE))
@@ -703,6 +709,395 @@ class LandingResilienceTests(unittest.TestCase):
         api._send = parallel_send
         with tempfile.TemporaryDirectory() as tmp:
             quiet(lander.run, ["select", tmp + "/w"], env(mode="dry-run"), api=api, config=CONFIG)
+
+
+
+
+class DisjointAncestorAndGraphQLTests(unittest.TestCase):
+    """Cut 8: disjoint-TU ancestor landing (with fresh G1-G8/G7 source rules), header priority, GraphQL batching."""
+
+    def _setup_ancestor_fixture(self, *, pr_file="src/Code/A.cpp", intervening_files=None,
+                                pr_status="modified", inline_state="success",
+                                rules_on_current=True, ahead_by=2, mergeable=True):
+        ancestor_main = MEASURED
+        new_main = "c" * 40
+        head = PR2
+        measured_tree = TREE
+        new_tree = "d" * 40
+        new_commit = "e" * 40
+        blob_sha = "b" * 40
+        src_tree_m, code_tree_m = "1" * 40, "2" * 40
+        src_tree_t, code_tree_t = "3" * 40, "4" * 40
+        if intervening_files is None:
+            intervening_files = [{"filename": "src/Code/Other.cpp", "status": "modified"}]
+
+        def edit(fx):
+            fx["pulls/2/files?per_page=100&page=1"] = [{"filename": pr_file, "status": pr_status}]
+            fx["pulls/2"]["mergeable"] = mergeable
+            fx["pulls/2"]["head"]["ref"] = "contrib/match-a"
+            fx[f"compare/{ancestor_main[:12]}...{new_main}"] = {
+                "status": "ahead",
+                "ahead_by": ahead_by,
+                "behind_by": 0,
+                "base_commit": {"sha": ancestor_main},
+                "merge_base_commit": {"sha": ancestor_main},
+                "files": intervening_files,
+            }
+            fx[f"git/commits/{new_commit}"] = {
+                "sha": new_commit,
+                "parents": [{"sha": new_main}],
+                "tree": {"sha": new_tree},
+                "message": (f"Title (#2)\n\n"
+                            f"Measured on main {new_main}, head {head}, tree {new_tree}.\n"
+                            f"Boat measured on disjoint ancestor {ancestor_main}, measured tree {measured_tree}.\n"
+                            f"Pull request #2.\n"
+                            f"{lander.TRAILER}, run 99."),
+            }
+            leaf = pr_file.split("/")[-1]
+            fx[f"git/trees/{measured_tree}"] = {"truncated": False, "tree": [{"path": "src", "type": "tree", "sha": src_tree_m}]}
+            fx[f"git/trees/{src_tree_m}"] = {"truncated": False, "tree": [{"path": "Code", "type": "tree", "sha": code_tree_m}]}
+            fx[f"git/trees/{code_tree_m}"] = {"truncated": False, "tree": [{"path": leaf, "type": "blob", "sha": blob_sha}]}
+            fx[f"git/trees/{new_tree}"] = {"truncated": False, "tree": [{"path": "src", "type": "tree", "sha": src_tree_t}]}
+            fx[f"git/trees/{src_tree_t}"] = {"truncated": False, "tree": [{"path": "Code", "type": "tree", "sha": code_tree_t}]}
+            fx[f"git/trees/{code_tree_t}"] = {"truncated": False, "tree": [{"path": leaf, "type": "blob", "sha": blob_sha}]}
+            statuses = fx[f"commits/{head}/statuses?per_page=100&page=1"]
+            for st in statuses:
+                if st.get("context") == lander.INLINE:
+                    st["state"] = inline_state
+                if st.get("context") == lander.RULES and rules_on_current:
+                    st["description"] = f"Source rules passed (main {new_main[:12]})"
+                    st["target_url"] = f"https://github.com/{lander.REPO}/actions/runs/999002"
+            fx["actions/runs/999002"] = {
+                "id": 999002,
+                "path": ".github/workflows/rules.yml",
+                "event": "repository_dispatch",
+                "head_sha": new_main,
+                "repository": {"id": lander.REPO_ID},
+                "status": "completed",
+                "conclusion": "success",
+                "run_attempt": 1,
+            }
+
+        api = FakeApi(live=True, main=new_main, edit=edit)
+        api.responses[("PUT", "pulls/2/merge")] = (200, {"merged": True, "sha": new_commit})
+        api.after_write[("PUT", "pulls/2/merge")] = lambda fx: fx["git/ref/heads/main"]["object"].update({"sha": new_commit})
+        return api, new_main, ancestor_main, head, measured_tree, new_tree, new_commit, blob_sha
+
+    def test_disjoint_ancestor_requires_fresh_source_rules_and_lands_with_whole_tree_verify(self):
+        # 1. Stale RULES on disjoint ancestor -> requests bfme-source-recheck (0 Boat VMs), does NOT land!
+        api_stale, new_main, anc, head, *_ = self._setup_ancestor_fixture(rules_on_current=False)
+        cfg = CONFIG | {"exceptions": set(), "auto_admission": True}
+        dec_stale = lander.evaluate(api_stale, 2, new_main, cfg)
+        self.assertEqual(dec_stale["stage"], "remeasure")
+        self.assertTrue(dec_stale.get("source_recheck_only"))
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _ = quiet(lander.run, ["select", tmp + "/w"], env(main=new_main, mode="live", pr="2"), api=api_stale, config=cfg)
+            self.assertEqual(code, 0)
+            events = [b["event_type"] for _, path, b in api_stale.writes if path == "dispatches"]
+            self.assertEqual(events, [lander.SOURCE_RECHECK_EVENT])
+
+        # 2. Fresh RULES on current_main + Boat on disjoint ancestor -> selects and lands with exact target_tree verify!
+        api, new_main, anc, head, mtree, ntree, ncommit, _ = self._setup_ancestor_fixture(rules_on_current=True)
+        decision = lander.evaluate(api, 2, new_main, cfg)
+        self.assertEqual(decision["stage"], "land")
+        self.assertTrue(decision["ancestor_landing"])
+        self.assertEqual(decision["measured_base"], anc)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            w = tmp + "/w"
+            code, out = quiet(lander.run, ["select", w], env(main=new_main, mode="live", pr="2"), api=api, config=cfg)
+            self.assertEqual(code, 0)
+            self.assertIn("disjoint ancestor", out)
+            saved = json.loads(Path(w, "binding.json").read_text())
+            self.assertEqual(saved["base"], anc)
+            self.assertEqual(saved["target_main"], new_main)
+            self.assertNotIn("pr_files", saved)  # keeps binding.json compact (<4 KiB)
+
+            if True:
+                put_receipts(w)
+                # Update rules receipt to match fresh source rules on new_main + ntree + run 999002
+                rp = Path(w, "rules/receipt.json")
+                rdoc = json.loads(rp.read_text())
+                rdoc.update({"base": new_main, "tools_commit": new_main, "tree": ntree, "run": "999002", "attempt": "1"})
+                rp.write_text(json.dumps(rdoc))
+                code, out = quiet(lander.run, ["land", w], env(main=new_main, mode="live", pr="2", run="99"),
+                                  api=api, config=cfg, sleep=lambda _: None)
+                self.assertEqual(code, 0)
+                self.assertIn(f"Landed #2 as {ncommit[:12]}", out)
+                # Verify bfme-landed dispatch happens BEFORE status(commit, "success") for crash safety
+                write_ops = [(path, (b.get("event_type") if path == "dispatches" else b.get("state")))
+                             for _, path, b in api.writes if path in ("dispatches", f"statuses/{ncommit}")]
+                idx_dispatch = write_ops.index(("dispatches", lander.LANDED_EVENT))
+                idx_status = write_ops.index((f"statuses/{ncommit}", "success"))
+                self.assertLess(idx_dispatch, idx_status)
+
+    def test_disjoint_ancestor_refuses_overlapping_or_non_tu_or_spoofed_inline_failure(self):
+        cfg = CONFIG | {"exceptions": set()}
+        # Overlapping file (case-insensitive)
+        api, new_main, *_ = self._setup_ancestor_fixture(
+            pr_file="src/Code/A.cpp",
+            intervening_files=[{"filename": "src/Code/a.cpp", "status": "modified"}],
+        )
+        self.assertEqual(lander.evaluate(api, 2, new_main, cfg)["stage"], "remeasure")
+
+        # Intervening header or stlport .c or removed file
+        for bad_intervening in (
+            [{"filename": "include/Game/Foo.h", "status": "modified"}],
+            [{"filename": "src/stlport-4.6/STLport-4.6/src/c_locale.c", "status": "modified"}],
+            [{"filename": "src/Code/Other.cpp", "status": "removed"}],
+        ):
+            api, new_main, *_ = self._setup_ancestor_fixture(intervening_files=bad_intervening)
+            self.assertEqual(lander.evaluate(api, 2, new_main, cfg)["stage"], "remeasure")
+
+        # Non-bot status posted AFTER a real bot Inline virtual failure cannot hide the failure
+        api_spoof, new_main, anc, head, *_ = self._setup_ancestor_fixture(inline_state="failure")
+        api_spoof.fx[f"commits/{head}/statuses?per_page=100&page=1"].append({
+            "id": 999999, "context": lander.INLINE, "state": "success",
+            "description": f"spoofed (main {anc[:12]})", "creator": {"id": 123456},
+        })
+        self.assertEqual(lander.evaluate(api_spoof, 2, new_main, cfg)["stage"], "remeasure")
+
+        # Exact-main non-bot status also cannot hide a fresh bot Inline virtual failure
+        api_exact = FakeApi(live=False, main=MEASURED)
+        for st in api_exact.fx[f"commits/{PR2}/statuses?per_page=100&page=1"]:
+            if st.get("context") == lander.INLINE:
+                st["state"] = "failure"
+        api_exact.fx[f"commits/{PR2}/statuses?per_page=100&page=1"].append({
+            "id": 999999, "context": lander.INLINE, "state": "success",
+            "description": f"spoofed (main {MEASURED[:12]})", "creator": {"id": 123456},
+        })
+        dec_exact = lander.evaluate(api_exact, 2, MEASURED, CONFIG)
+        self.assertEqual(dec_exact["stage"], "hold")
+        self.assertIn("inline-virtual-failure", [r.code for r in dec_exact["reasons"]])
+
+    def test_header_priority_prevents_starvation_and_ignores_stale_boat_pending(self):
+        cfg = CONFIG | {"exceptions": set(), "auto_headers": True}
+        # 1. Stale header PR #5 waiting to re-measure takes priority over ready narrow PR #2 (no starvation!)
+        def edit_stale_header(fx):
+            pr2 = copy.deepcopy(fx["pulls/2"])
+            pr2["head"]["ref"] = "contrib/narrow"
+            fx["pulls/2"] = pr2
+            fx["pulls/2/files?per_page=100&page=1"] = [{"filename": "src/Code/A.cpp", "status": "modified"}]
+            pr5 = copy.deepcopy(pr2)
+            pr5["number"] = 5
+            pr5["head"]["ref"] = "contrib/header"
+            pr5["head"]["sha"] = "5" * 40
+            fx["pulls/5"] = pr5
+            fx["pulls/5/files?per_page=100&page=1"] = [{"filename": "include/Game/A.h", "status": "modified"}]
+            fx[f"commits/{'5'*40}/statuses?per_page=100&page=1"] = [
+                {"id": 1, "context": lander.BOAT, "state": "success",
+                 "description": "BFME II comparison passed (main 000000000000)", "creator": {"id": lander.lr.BOT_ID}},
+                {"id": 2, "context": lander.RULES, "state": "success",
+                 "description": "Source rules passed (main 000000000000)", "creator": {"id": lander.lr.BOT_ID}},
+                {"id": 3, "context": lander.HEADER_RULES_CONTEXT, "state": "success",
+                 "description": "Header rules passed (main 000000000000)", "creator": {"id": lander.lr.BOT_ID}},
+            ]
+            fx["pulls?state=open&base=main&sort=created&direction=asc&per_page=100&page=1"] = [{"number": 2}, {"number": 5}]
+
+        api = FakeApi(live=True, main=MEASURED, edit=edit_stale_header)
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out = quiet(lander.run, ["select", tmp + "/w"], env(main=MEASURED, mode="live"), api=api, config=cfg)
+            self.assertEqual(code, 0)
+            self.assertFalse(Path(tmp, "w/binding.json").exists())
+            dispatches = [b for _, path, b in api.writes if path == "dispatches"]
+            self.assertEqual(dispatches[0]["client_payload"]["number"], 5)
+
+        # 2. Stale Boat pending from an OLD main does NOT pause ready narrow PR #2!
+        now_s = lander.datetime.datetime.now(lander.datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        def edit_old_pending(fx):
+            pr2 = copy.deepcopy(fx["pulls/2"])
+            pr2["head"]["ref"] = "contrib/narrow"
+            fx["pulls/2"] = pr2
+            fx["pulls/2/files?per_page=100&page=1"] = [{"filename": "src/Code/A.cpp", "status": "modified"}]
+            pr5 = copy.deepcopy(pr2)
+            pr5["number"] = 5
+            pr5["head"]["ref"] = "contrib/header"
+            pr5["head"]["sha"] = "5" * 40
+            fx["pulls/5"] = pr5
+            fx["pulls/5/files?per_page=100&page=1"] = [{"filename": "include/Game/A.h", "status": "modified"}]
+            fx[f"commits/{'5'*40}/statuses?per_page=100&page=1"] = [
+                {"id": 1, "context": lander.BOAT, "state": "pending", "created_at": now_s,
+                 "description": "Measuring (main 000000000000)", "creator": {"id": lander.lr.BOT_ID}},
+                {"id": 2, "context": lander.RULES, "state": "success",
+                 "description": f"Source rules passed (main {MEASURED[:12]})", "creator": {"id": lander.lr.BOT_ID}},
+            ]
+            fx["pulls?state=open&base=main&sort=created&direction=asc&per_page=100&page=1"] = [{"number": 2}, {"number": 5}]
+
+        api2 = FakeApi(live=False, main=MEASURED, edit=edit_old_pending)
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out = quiet(lander.run, ["select", tmp + "/w"], env(main=MEASURED, mode="dry-run"), api=api2, config=cfg)
+            self.assertEqual(code, 0)
+            self.assertTrue(Path(tmp, "w/binding.json").is_file())
+            self.assertEqual(json.loads(Path(tmp, "w/binding.json").read_text())["number"], 2)
+
+    def test_graphql_batch_reader_includes_author_id_for_header_review_and_auto_admission_text(self):
+        real_api = lander.Api("Open-BFME/BFME2-Rebuild", "ghp_" + "a" * 36, live=False)
+        with self.assertRaises(lander.ApiError):
+            real_api.query("mutation { foo }", {})
+
+        head = PR2
+        api = FakeApi(live=False, main=MEASURED)
+        api.fx["pulls/2/reviews?per_page=100&page=1"] = [
+            {"id": 1, "user": {"id": 1760627}, "state": "APPROVED", "commit_id": head},
+        ]
+        def fake_query(q, variables):
+            return {"repository": {"pullRequests": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [{
+                    "number": 2, "id": "PR_2", "title": "Header A", "state": "OPEN",
+                    "isDraft": False, "authorAssociation": "CONTRIBUTOR", "mergeable": "MERGEABLE",
+                    "baseRefName": "main", "headRefName": "contrib/a", "headRefOid": head,
+                    "author": {"login": "alice", "databaseId": 55555},
+                    "headRepository": {"databaseId": 9999}, "baseRepository": {"databaseId": lander.REPO_ID},
+                    "labels": {"nodes": []},
+                    "files": {"totalCount": 1, "nodes": [{"path": "include/Game/A.h", "changeType": "MODIFIED"}]},
+                    "commits": {"nodes": [{"commit": {"status": {"contexts": [
+                        {"context": lander.ADMISSION_CONTEXT, "state": "SUCCESS",
+                         "description": f"Admitted by rule: header change (main {MEASURED[:12]})",
+                         "targetUrl": "", "createdAt": "", "creator": {"databaseId": lander.lr.BOT_ID}},
+                        {"context": lander.RULES, "state": "SUCCESS",
+                         "description": f"Source rules passed (main {MEASURED[:12]})",
+                         "targetUrl": "", "createdAt": "", "creator": {"databaseId": lander.lr.BOT_ID}},
+                    ]}}}]},
+                }],
+            }}}
+        api.query = fake_query
+        cfg = CONFIG | {"exceptions": set(), "auto_admission": True, "auto_headers": True, "approvers": {1760627}}
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out = quiet(lander.run, ["select", tmp + "/w"], env(main=MEASURED, mode="dry-run"), api=api, config=cfg)
+        self.assertEqual(code, 0)
+        self.assertIn("awaiting-measurement", out)
+        self.assertNotIn("remove and add the boat-ok label", out)
+
+    def test_graphql_falls_back_to_rest_when_non_bot_masks_inline_failure(self):
+        api = FakeApi(live=False, main=MEASURED)
+        for st in api.fx[f"commits/{PR2}/statuses?per_page=100&page=1"]:
+            if st.get("context") == lander.INLINE:
+                st["state"] = "failure"
+        def fake_query(q, variables):
+            return {"repository": {"pullRequests": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [{
+                    "number": 2, "id": "PR_2", "title": "Match A", "state": "OPEN",
+                    "isDraft": False, "authorAssociation": "OWNER", "mergeable": "MERGEABLE",
+                    "baseRefName": "main", "headRefName": "contrib/a", "headRefOid": PR2,
+                    "author": {"login": "alice", "databaseId": 1},
+                    "headRepository": {"databaseId": lander.REPO_ID}, "baseRepository": {"databaseId": lander.REPO_ID},
+                    "labels": {"nodes": []},
+                    "files": {"totalCount": 1, "nodes": [{"path": "src/Code/A.cpp", "changeType": "MODIFIED"}]},
+                    "commits": {"nodes": [{"commit": {"status": {"contexts": [
+                        {"context": lander.BOAT, "state": "SUCCESS",
+                         "description": f"BFME II comparison passed (main {MEASURED[:12]})",
+                         "targetUrl": "", "createdAt": "", "creator": {"databaseId": lander.lr.BOT_ID}},
+                        {"context": lander.RULES, "state": "SUCCESS",
+                         "description": f"Source rules passed (main {MEASURED[:12]})",
+                         "targetUrl": "", "createdAt": "", "creator": {"databaseId": lander.lr.BOT_ID}},
+                        {"context": lander.INLINE, "state": "SUCCESS",
+                         "description": f"spoofed (main {MEASURED[:12]})",
+                         "targetUrl": "", "createdAt": "", "creator": {"databaseId": 999999}},
+                    ]}}}]},
+                }],
+            }}}
+        api.query = fake_query
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out = quiet(lander.run, ["select", tmp + "/w"], env(main=MEASURED, mode="dry-run"),
+                              api=api, config=CONFIG | {"exceptions": set()})
+        self.assertEqual(code, 0)
+        self.assertIn("inline-virtual-failure", out)
+
+    def test_stale_old_main_pendings_do_not_starve_header_dispatch_or_block_narrow_land(self):
+        def edit_stale_pendings(fx):
+            pr2 = copy.deepcopy(fx["pulls/2"])
+            pr2["head"]["ref"] = "contrib/narrow"
+            fx["pulls/2"] = pr2
+            fx["pulls/2/files?per_page=100&page=1"] = [{"filename": "src/Code/A.cpp", "status": "modified"}]
+            pr_list = [{"number": 2}]
+            for idx in range(10, 15):
+                p = copy.deepcopy(pr2)
+                p["number"] = idx
+                p["head"]["sha"] = f"{idx:040x}"
+                fx[f"pulls/{idx}"] = p
+                fx[f"pulls/{idx}/files?per_page=100&page=1"] = [{"filename": f"src/Code/P{idx}.cpp", "status": "modified"}]
+                fx[f"commits/{p['head']['sha']}/statuses?per_page=100&page=1"] = [
+                    {"id": 1, "context": lander.BOAT, "state": "pending",
+                     "description": "Measuring (main 000000000000)", "creator": {"id": lander.lr.BOT_ID}},
+                    {"id": 2, "context": lander.RULES, "state": "success",
+                     "description": f"Source rules passed (main {MEASURED[:12]})", "creator": {"id": lander.lr.BOT_ID}},
+                ]
+                pr_list.append({"number": idx})
+            pr5 = copy.deepcopy(pr2)
+            pr5["number"] = 5
+            pr5["head"]["sha"] = "5" * 40
+            fx["pulls/5"] = pr5
+            fx["pulls/5/files?per_page=100&page=1"] = [{"filename": "include/Game/A.h", "status": "modified"}]
+            fx[f"commits/{'5'*40}/statuses?per_page=100&page=1"] = [
+                {"id": 1, "context": lander.BOAT, "state": "success",
+                 "description": "BFME II comparison passed (main 000000000000)", "creator": {"id": lander.lr.BOT_ID}},
+                {"id": 2, "context": lander.RULES, "state": "success",
+                 "description": "Source rules passed (main 000000000000)", "creator": {"id": lander.lr.BOT_ID}},
+                {"id": 3, "context": lander.HEADER_RULES_CONTEXT, "state": "success",
+                 "description": "Header rules passed (main 000000000000)", "creator": {"id": lander.lr.BOT_ID}},
+            ]
+            pr_list.append({"number": 5})
+            fx["pulls?state=open&base=main&sort=created&direction=asc&per_page=100&page=1"] = pr_list
+
+        api = FakeApi(live=True, main=MEASURED, edit=edit_stale_pendings)
+        cfg = CONFIG | {"exceptions": set(), "auto_headers": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out = quiet(lander.run, ["select", tmp + "/w"], env(main=MEASURED, mode="live"), api=api, config=cfg)
+            self.assertEqual(code, 0)
+            dispatches = [b for _, path, b in api.writes if path == "dispatches"]
+            self.assertTrue(dispatches and dispatches[0]["client_payload"]["number"] == 5,
+                            f"Expected stale header #5 to dispatch despite 5 old-main pendings, got {dispatches}")
+
+    def test_merge_http_403_end_to_end_replaces_cleared_status_and_chains_next(self):
+        api = FakeApi(live=True, main=MEASURED)
+        api.responses[("PUT", "pulls/2/merge")] = (403, {"message": "Resource not accessible by integration"})
+        api.last_headers = {"x-accepted-github-permissions": "contents=write", "x-github-request-id": "REQ123"}
+        with tempfile.TemporaryDirectory() as tmp:
+            w = tmp + "/w"
+            code, _ = quiet(lander.run, ["select", w], env(pr="2", mode="live"), api=api, config=CONFIG)
+            self.assertEqual(code, 0)
+            put_receipts(w)
+            run_env = env(pr="2", mode="live") | {"BFME_LANDING_CHAIN": "1"}
+            with self.assertRaises(lander.Held) as ctx:
+                quiet(lander.run, ["land", w], run_env, api=api, config=CONFIG, sleep=lambda _: None)
+        self.assertEqual(ctx.exception.code, "merge-forbidden")
+        self.assertTrue(ctx.exception.final)
+        head_statuses = [b for _, path, b in api.writes if path == f"statuses/{PR2}"]
+        self.assertEqual(head_statuses[-1]["state"], "failure")
+        self.assertTrue(head_statuses[-1]["description"].startswith("Held: merge-forbidden."))
+        comments = [b["body"] for _, path, b in api.writes if path == "issues/2/comments"]
+        self.assertTrue(any("HTTP 403" in c for c in comments))
+        dispatches = [b["event_type"] for _, path, b in api.writes if path == "dispatches"]
+        self.assertIn(lander.NEXT_EVENT, dispatches)
+
+    def test_disjoint_ancestor_allows_build_neutral_intervening_changes(self):
+        api = FakeApi(live=True, main=MEASURED)
+        older = "7" * 40
+        api.fx[f"compare/{older[:12]}...{MEASURED}"] = {
+            "status": "ahead", "ahead_by": 2, "behind_by": 0,
+            "base_commit": {"sha": older}, "merge_base_commit": {"sha": older},
+            "files": [
+                {"filename": "docs/agents.md", "status": "modified"},
+                {"filename": "ci/progress/card.py", "status": "modified"},
+                {"filename": "src/Code/GameEngine/Other.cpp", "status": "modified"},
+            ],
+        }
+        anc = lander.resolve_disjoint_ancestor(api, older[:12], MEASURED, ["src/Code/GameEngine/Mine.cpp"])
+        self.assertEqual(anc, older)
+
+    def test_merge_http_403_holds_pr_without_blocking_other_candidates(self):
+        api = FakeApi(live=True, main=MEASURED)
+        api.fx[f"commits/{PR2}/statuses?per_page=100&page=1"].append({
+            "id": 99999, "context": lander.LANDING_CONTEXT, "state": "failure",
+            "description": "Held: merge-forbidden. Expected GitHub to allow the landing workflow to merge.",
+            "creator": {"id": lander.lr.BOT_ID},
+        })
+        dec = lander.evaluate(api, 2, MEASURED, CONFIG)
+        self.assertEqual(dec["stage"], "hold")
+        self.assertEqual(dec["reasons"][0].code, "merge-forbidden")
+        self.assertTrue(dec["reasons"][0].final)
 
 
 if __name__ == "__main__":

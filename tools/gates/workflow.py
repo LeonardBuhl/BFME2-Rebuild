@@ -53,7 +53,7 @@ REASONS = {
 
 # bfme-remeasure: the compiler check's own intake. bfme-source-refresh: admission asks for the source rules of a
 # fork commit on a main that moved since its last event (.github/workflows/rules.yml; no compiler machine).
-DISPATCH_ACTIONS = ("bfme-remeasure", "bfme-source-refresh")
+DISPATCH_ACTIONS = ("bfme-remeasure", "bfme-source-refresh", "bfme-source-recheck")
 # Aggregate status texts for what only the author can fix on this main; ci/admission/admit.py reads them.
 CONFLICT_OUTCOME = "Conflicts with main: merge or rebase main into your branch and push"
 HISTORY_OUTCOME = "No shared history with main: rebase your branch on main and push"
